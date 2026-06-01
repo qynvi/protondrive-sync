@@ -1,13 +1,15 @@
 """Tests for migration module."""
 
+import threading
 import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 
 from protondrive_sync.core.config import AppConfig, FolderMapping
 from protondrive_sync.core.migration import (
     plan_migration,
     execute_migration,
+    execute_bisync_setup,
     rollback_migration,
     cleanup_backup,
     teardown_mount,
@@ -16,12 +18,13 @@ from protondrive_sync.core.migration import (
     _matches_filter,
     _find_filtered_toplevel,
     _find_env_files,
+    _MAX_ATTEMPTS,
     MigrationError,
     MigrationPlan,
     BisyncPlan,
     DivergenceReport,
 )
-from protondrive_sync.core.rclone import RemoteFileInfo
+from protondrive_sync.core.rclone import RemoteFileInfo, RcloneError, RcloneCancelled
 
 
 @pytest.fixture
@@ -113,14 +116,17 @@ class TestExecuteMigration:
         mock_verify.assert_called_once()
         mock_link.assert_called_once()
 
+    @patch("protondrive_sync.core.migration.time.sleep")
     @patch("protondrive_sync.core.migration.sync_upload", side_effect=Exception("network error"))
-    def test_upload_failure(self, mock_upload, source_dir, config):
+    def test_upload_failure(self, mock_upload, mock_sleep, source_dir, config):
         plan = plan_migration(str(source_dir), "test", config)
         result = execute_migration(plan, config)
 
         assert not result.success
         # Source should still exist (not moved)
         assert source_dir.exists()
+        # All retry attempts should have been made
+        assert mock_upload.call_count == _MAX_ATTEMPTS
 
     @patch("protondrive_sync.core.migration.sync_upload")
     @patch("protondrive_sync.core.migration.verify_sync", return_value=False)
@@ -682,3 +688,133 @@ class TestPlanBisyncSetup:
         empty.mkdir()
         plan = plan_bisync_setup(str(empty), "test", config)
         assert plan.local_is_empty
+
+
+# --- execute_bisync_setup retry logic ---
+
+
+def _make_bisync_plan(tmp_path, *, local_is_empty=False, file_count=3):
+    """Helper: build a BisyncPlan for testing."""
+    src = tmp_path / "proj"
+    src.mkdir(exist_ok=True)
+    if not local_is_empty:
+        (src / "a.py").write_text("a")
+    return BisyncPlan(
+        local_path=src,
+        remote_subpath="workspace/proj",
+        file_count=file_count,
+        total_size_bytes=100,
+        local_is_empty=local_is_empty,
+    )
+
+
+class TestBisyncSetupRetry:
+    @patch("protondrive_sync.core.migration.time.sleep")
+    @patch("protondrive_sync.core.migration.rclone_mkdir")
+    @patch("protondrive_sync.core.migration.run_bisync")
+    def test_succeeds_first_attempt(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
+        """No retry needed when first attempt succeeds."""
+        plan = _make_bisync_plan(tmp_path)
+        result = execute_bisync_setup(plan, config)
+        assert result.success
+        assert mock_bisync.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("protondrive_sync.core.migration.time.sleep")
+    @patch("protondrive_sync.core.migration.rclone_mkdir")
+    @patch("protondrive_sync.core.migration.run_bisync")
+    def test_succeeds_on_retry(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
+        """Recovers after transient failures."""
+        mock_bisync.side_effect = [
+            RcloneError("stalled"),
+            RcloneError("API 429"),
+            None,  # third attempt succeeds
+        ]
+        logs = []
+        result = execute_bisync_setup(plan=_make_bisync_plan(tmp_path), config=config, progress=logs.append)
+        assert result.success
+        assert mock_bisync.call_count == 3
+        assert any("Retrying" in l for l in logs)
+
+    @patch("protondrive_sync.core.migration.time.sleep")
+    @patch("protondrive_sync.core.migration.rclone_mkdir")
+    @patch("protondrive_sync.core.migration.run_bisync", side_effect=RcloneError("fail"))
+    def test_all_attempts_exhausted(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
+        """Returns failure after all retry attempts are exhausted."""
+        result = execute_bisync_setup(plan=_make_bisync_plan(tmp_path), config=config)
+        assert not result.success
+        assert not result.cancelled
+        assert mock_bisync.call_count == _MAX_ATTEMPTS
+        assert f"after {_MAX_ATTEMPTS} attempts" in result.message
+
+    @patch("protondrive_sync.core.migration.time.sleep")
+    @patch("protondrive_sync.core.migration.rclone_mkdir")
+    @patch("protondrive_sync.core.migration.run_bisync", side_effect=RcloneCancelled("abort"))
+    def test_cancel_not_retried(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
+        """Cancellation is never retried."""
+        result = execute_bisync_setup(plan=_make_bisync_plan(tmp_path), config=config)
+        assert not result.success
+        assert result.cancelled
+        assert mock_bisync.call_count == 1
+
+    @patch("protondrive_sync.core.migration.time.sleep")
+    @patch("protondrive_sync.core.migration.rclone_mkdir")
+    @patch("protondrive_sync.core.migration.run_bisync")
+    def test_cancel_during_backoff(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
+        """Cancel event during backoff wait aborts early."""
+        cancel = threading.Event()
+        # First bisync call fails AND sets the cancel event so the
+        # subsequent backoff wait detects cancellation immediately.
+        def fail_and_cancel(*args, **kwargs):
+            cancel.set()
+            raise RcloneError("fail")
+        mock_bisync.side_effect = fail_and_cancel
+        plan = _make_bisync_plan(tmp_path)
+        result = execute_bisync_setup(plan, config, cancel_event=cancel)
+        assert not result.success
+        assert result.cancelled
+        # Only one bisync call — cancel hits during backoff
+        assert mock_bisync.call_count == 1
+
+
+class TestMountMigrationRetry:
+    @patch("protondrive_sync.core.migration.time.sleep")
+    @patch("protondrive_sync.core.migration.sync_upload")
+    @patch("protondrive_sync.core.migration.verify_sync", return_value=True)
+    @patch("protondrive_sync.core.migration.create_link")
+    def test_upload_succeeds_on_retry(
+        self, mock_link, mock_verify, mock_upload, mock_sleep, source_dir, config,
+    ):
+        """Upload retries after transient failure and succeeds."""
+        mock_upload.side_effect = [
+            RcloneError("stalled"),
+            None,  # second attempt succeeds
+        ]
+        plan = plan_migration(str(source_dir), "projects/test", config)
+        logs = []
+        result = execute_migration(plan, config, progress=logs.append)
+        assert result.success
+        assert mock_upload.call_count == 2
+        assert any("Retrying upload" in l for l in logs)
+
+    @patch("protondrive_sync.core.migration.time.sleep")
+    @patch("protondrive_sync.core.migration.sync_upload", side_effect=RcloneError("fail"))
+    def test_upload_all_attempts_fail(self, mock_upload, mock_sleep, source_dir, config):
+        """Returns failure after all upload retry attempts are exhausted."""
+        plan = plan_migration(str(source_dir), "projects/test", config)
+        result = execute_migration(plan, config)
+        assert not result.success
+        assert mock_upload.call_count == _MAX_ATTEMPTS
+        assert f"after {_MAX_ATTEMPTS} attempts" in result.message
+        # Source dir should still exist (not moved to backup)
+        assert source_dir.exists()
+
+    @patch("protondrive_sync.core.migration.time.sleep")
+    @patch("protondrive_sync.core.migration.sync_upload", side_effect=RcloneCancelled("abort"))
+    def test_upload_cancel_not_retried(self, mock_upload, mock_sleep, source_dir, config):
+        """Cancellation during upload is never retried."""
+        plan = plan_migration(str(source_dir), "projects/test", config)
+        result = execute_migration(plan, config)
+        assert not result.success
+        assert result.cancelled
+        assert mock_upload.call_count == 1

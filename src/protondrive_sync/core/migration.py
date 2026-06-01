@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import fnmatch
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -380,6 +381,24 @@ def plan_bisync_setup(
     )
 
 
+_RETRY_DELAYS = (15, 45, 90)  # seconds between automatic retries
+_MAX_ATTEMPTS = 1 + len(_RETRY_DELAYS)  # 4 total
+
+
+def _wait_with_cancel(
+    seconds: int, cancel_event: Optional[threading.Event],
+) -> bool:
+    """Sleep for *seconds*, checking *cancel_event* every 0.5s.
+
+    Returns True if cancelled, False if the wait completed normally.
+    """
+    for _ in range(seconds * 2):
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def execute_bisync_setup(
     plan: BisyncPlan,
     config: AppConfig,
@@ -392,6 +411,11 @@ def execute_bisync_setup(
 
     Much simpler than mount migration — no backup, no symlink, no file moving.
     The local directory stays exactly as-is.
+
+    Automatically retries on transient failures (up to 4 attempts with
+    exponential backoff).  rclone bisync --resync is idempotent — already-
+    uploaded files are skipped on retry, so each attempt makes incremental
+    progress.
 
     If cancel_event is provided and set, the operation is aborted.
     """
@@ -419,20 +443,43 @@ def execute_bisync_setup(
         if cancel_event is not None and cancel_event.is_set():
             raise RcloneCancelled("Operation cancelled by user")
 
-        _log(f"Running initial bisync (--resync) for {plan.local_path} ...")
-        run_bisync(
-            str(plan.local_path),
-            plan.remote_subpath,
-            config,
-            resync=True,
-            progress=_log,
-            cancel_event=cancel_event,
-        )
-        _log("Initial bisync complete. Folder is now tracked.")
+        # Retry loop — rclone bisync --resync is idempotent
+        last_error: Optional[Exception] = None
+        for attempt in range(_MAX_ATTEMPTS):
+            if attempt > 0:
+                delay = _RETRY_DELAYS[attempt - 1]
+                _log("")
+                _log(f"Retrying in {delay}s (attempt {attempt + 1}/{_MAX_ATTEMPTS}) ...")
+                if _wait_with_cancel(delay, cancel_event):
+                    raise RcloneCancelled("Operation cancelled by user")
+
+            try:
+                _log(f"Running initial bisync (--resync) for {plan.local_path} ...")
+                run_bisync(
+                    str(plan.local_path),
+                    plan.remote_subpath,
+                    config,
+                    resync=True,
+                    progress=_log,
+                    cancel_event=cancel_event,
+                )
+                _log("Initial bisync complete. Folder is now tracked.")
+                return MigrationResult(
+                    success=True,
+                    mapping=mapping,
+                    message="Bisync setup complete. Folder synced with Proton Drive.",
+                )
+            except RcloneCancelled:
+                raise  # never retry cancellation
+            except (RcloneError, Exception) as exc:
+                last_error = exc
+                _log(f"Attempt {attempt + 1} failed: {exc}")
+
+        # All attempts exhausted
         return MigrationResult(
-            success=True,
+            success=False,
             mapping=mapping,
-            message="Bisync setup complete. Folder synced with Proton Drive.",
+            message=f"Bisync setup failed after {_MAX_ATTEMPTS} attempts: {last_error}",
         )
     except RcloneCancelled:
         _log("Setup cancelled.")
@@ -441,12 +488,6 @@ def execute_bisync_setup(
             mapping=mapping,
             message="Setup cancelled by user.",
             cancelled=True,
-        )
-    except RcloneError as exc:
-        return MigrationResult(
-            success=False,
-            mapping=mapping,
-            message=f"Bisync setup failed: {exc}",
         )
     except Exception as exc:
         return MigrationResult(
@@ -493,10 +534,30 @@ def execute_migration(
         if cancel_event is not None and cancel_event.is_set():
             raise RcloneCancelled("Operation cancelled by user")
 
-        # Step 1: Upload
+        # Step 1: Upload (with automatic retry — rclone copy is idempotent)
         _log(f"Uploading {plan.file_count} files ({plan.total_size_human}) to {config.remote_name}:{plan.remote_subpath} ...")
-        sync_upload(str(plan.local_path), plan.remote_subpath, config,
-                     progress=_log, cancel_event=cancel_event)
+        upload_last_error: Optional[Exception] = None
+        for attempt in range(_MAX_ATTEMPTS):
+            if attempt > 0:
+                delay = _RETRY_DELAYS[attempt - 1]
+                _log("")
+                _log(f"Retrying upload in {delay}s (attempt {attempt + 1}/{_MAX_ATTEMPTS}) ...")
+                if _wait_with_cancel(delay, cancel_event):
+                    raise RcloneCancelled("Operation cancelled by user")
+            try:
+                sync_upload(str(plan.local_path), plan.remote_subpath, config,
+                             progress=_log, cancel_event=cancel_event)
+                upload_last_error = None
+                break
+            except RcloneCancelled:
+                raise
+            except (RcloneError, Exception) as exc:
+                upload_last_error = exc
+                _log(f"Upload attempt {attempt + 1} failed: {exc}")
+        if upload_last_error is not None:
+            raise MigrationError(
+                f"Upload failed after {_MAX_ATTEMPTS} attempts: {upload_last_error}"
+            )
         _log("Upload complete.")
 
         # Step 2: Verify

@@ -556,8 +556,12 @@ class AddFolderScreen(Screen):
             self._log("")
             self._log(f"Setup failed: {result.message}")
             self._log("")
-            self._log("Tip: This may be caused by Proton Drive API rate limits.")
-            self._log("     Try enabling low-footprint mode in Settings, or retry.")
+            if "stalled" in result.message:
+                self._log("The upload stalled (no progress for 5 minutes).")
+                self._log("This may indicate a network issue or Proton API outage.")
+            else:
+                self._log("Already-uploaded files are preserved on remote.")
+            self._log("Press 'Setup & Save' to retry (completed files are skipped).")
             self._reset_buttons()
 
     def _worker_mount_migrate(self, local: str, remote: str, pin: str) -> None:
@@ -611,8 +615,12 @@ class AddFolderScreen(Screen):
             self._log("")
             self._log(f"Migration failed: {result.message}")
             self._log("")
-            self._log("Tip: This may be caused by Proton Drive API rate limits.")
-            self._log("     Try enabling low-footprint mode in Settings, or retry.")
+            if "stalled" in result.message:
+                self._log("The upload stalled (no progress for 5 minutes).")
+                self._log("This may indicate a network issue or Proton API outage.")
+            else:
+                self._log("Already-uploaded files are preserved on remote.")
+            self._log("Press 'Setup & Save' to retry (completed files are skipped).")
             self._reset_buttons()
 
     def _worker_mount_pull(self, local: str, remote: str, pin: str) -> None:

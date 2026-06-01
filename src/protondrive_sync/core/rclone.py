@@ -85,7 +85,7 @@ def _run_streaming(
     args: list[str],
     progress: ProgressCallback,
     *,
-    timeout: int = 3600,
+    activity_timeout: int = 300,
     cancel_event: Optional[threading.Event] = None,
 ) -> int:
     """Run an rclone command with real-time output streaming.
@@ -93,6 +93,11 @@ def _run_streaming(
     rclone emits progress stats to stderr. Per-file transfer info also
     goes to stderr with -v. We read both stdout and stderr line-by-line
     and forward to the progress callback.
+
+    Uses an activity-based timeout: the process is killed only if no
+    output is received for *activity_timeout* seconds. This allows
+    long-running uploads to proceed indefinitely as long as rclone is
+    making progress (--stats 2s ensures output every 2 seconds).
 
     If cancel_event is provided and becomes set, the process is terminated
     and RcloneCancelled is raised.
@@ -111,11 +116,14 @@ def _run_streaming(
         raise RcloneError(f"rclone binary not found: {exc}") from exc
 
     stderr_lines: list[str] = []
+    # Mutable container so reader threads can update the timestamp
+    last_activity = [time.monotonic()]
 
     def _read_stream(stream: object, label: str) -> None:
         for line in stream:  # type: ignore[union-attr]
             stripped = line.rstrip()
             if stripped:
+                last_activity[0] = time.monotonic()
                 stderr_lines.append(stripped)
                 progress(f"  {stripped}")
 
@@ -125,8 +133,7 @@ def _run_streaming(
     t_out.start()
     t_err.start()
 
-    # Poll loop: check for cancellation every 0.5s
-    deadline = time.monotonic() + timeout
+    # Poll loop: check for cancellation / activity every 0.5s
     cancelled = False
     while True:
         try:
@@ -142,13 +149,15 @@ def _run_streaming(
                     proc.kill()
                     proc.wait()
                 break
-            if time.monotonic() > deadline:
+            idle = time.monotonic() - last_activity[0]
+            if idle > activity_timeout:
                 proc.kill()
                 proc.wait()
                 t_out.join(timeout=5)
                 t_err.join(timeout=5)
                 raise RcloneError(
-                    f"rclone command timed out after {timeout}s: {' '.join(cmd)}"
+                    f"rclone stalled (no output for {activity_timeout}s): "
+                    f"{' '.join(cmd)}"
                 )
 
     t_out.join(timeout=5)
@@ -390,6 +399,10 @@ def build_bisync_args(
         # Disable rclone's built-in abort-on-mass-delete — we handle
         # safety checks ourselves in core/bisync.py
         "--resilient",
+        # Auto-recover from interrupted bisync runs using backup listings
+        "--recover",
+        # Auto-expire lock files left by crashed runs (2 minute max)
+        "--max-lock", "2m",
         # Symlink handling: follow symlinks and sync target content as
         # regular files, or silently skip them if disabled
         "--copy-links" if config.copy_links else "--skip-links",
@@ -439,7 +452,7 @@ def run_bisync(
                 continue
             cleaned.append(arg)
         cleaned.extend(_stats_args())
-        _run_streaming(cleaned, progress, timeout=3600, cancel_event=cancel_event)
+        _run_streaming(cleaned, progress, cancel_event=cancel_event)
         return ""
     else:
         result = _run(args, timeout=3600)
@@ -489,7 +502,7 @@ def sync_upload(
 
     if progress:
         args.extend(_stats_args())
-        _run_streaming(args, progress, timeout=3600, cancel_event=cancel_event)
+        _run_streaming(args, progress, cancel_event=cancel_event)
     else:
         args.append("-v")
         result = _run(args, timeout=3600)
