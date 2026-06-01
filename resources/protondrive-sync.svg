@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#6D4AFF"/>
+    </linearGradient>
+    <linearGradient id="cloud" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#E0D4FF"/>
+    </linearGradient>
+  </defs>
+  <!-- Rounded square background (Proton style) -->
+  <rect x="4" y="4" width="120" height="120" rx="26" ry="26" fill="url(#bg)"/>
+  <!-- Cloud shape -->
+  <path d="M88 72c0-11-9-20-20-20a20 20 0 0 0-19 14 14 14 0 0 0-15 14
+           14 14 0 0 0 14 14h38a12 12 0 0 0 12-12
+           12 12 0 0 0-10-10z"
+        fill="url(#cloud)" opacity="0.95"
+        transform="translate(-2, -6)"/>
+  <!-- Sync arrows (circular) -->
+  <!-- Arrow 1: clockwise top -->
+  <path d="M56 38 a18 18 0 0 1 22 4" stroke="white" stroke-width="3.5"
+        fill="none" stroke-linecap="round"/>
+  <polygon points="79,38 78,46 72,40" fill="white"/>
+  <!-- Arrow 2: counter-clockwise bottom -->
+  <path d="M72 98 a18 18 0 0 1-22-4" stroke="white" stroke-width="3.5"
+        fill="none" stroke-linecap="round"/>
+  <polygon points="49,98 50,90 56,96" fill="white"/>
+</svg>

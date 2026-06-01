@@ -1,0 +1,475 @@
+"""Bisync intelligence — adaptive timing, delete protection, change detection.
+
+This module handles all the smart logic around bisync:
+- Activity-window coalescing (adaptive sync timing)
+- Work file delete protection (rename-backup on remote)
+- Large change detection (flag suspicious size changes for review)
+- Pending review management (block sync until user approves)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from .config import AppConfig, FolderMapping
+from .rclone import rclone_lsjson, rclone_moveto, RemoteFileInfo, RcloneError
+from .migration import _matches_filter
+
+
+# --- Backup directory for delete-protected files ---
+
+BACKUP_DIR_NAME = ".protondrive-sync-backups"
+
+# --- Work file extensions (protected from delete-sync) ---
+
+WORK_EXTENSIONS: set[str] = {
+    # Code
+    ".py", ".pyw", ".pyi",
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hh",
+    ".java", ".kt", ".kts",
+    ".go", ".rs", ".rb", ".php", ".swift", ".scala",
+    ".sh", ".bash", ".zsh", ".fish",
+    ".sql", ".r", ".m", ".mm",
+    ".cs", ".fs", ".vb",
+    ".lua", ".pl", ".pm", ".ex", ".exs",
+    ".zig", ".nim", ".v", ".d",
+    # Config / data
+    ".json", ".yaml", ".yml", ".toml", ".xml", ".csv", ".ini", ".cfg",
+    ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".md", ".rst", ".tex", ".txt",
+    # Documents
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+    ".ppt", ".pptx", ".odt", ".ods", ".odp",
+    # Notebooks
+    ".ipynb",
+    # Other
+    ".proto", ".graphql", ".gql",
+    ".makefile", ".dockerfile",
+}
+
+
+def is_work_file(filepath: str) -> bool:
+    """Check if a file has a protected work extension."""
+    ext = Path(filepath).suffix.lower()
+    # Also match extensionless known filenames
+    name = Path(filepath).name.lower()
+    if name in ("makefile", "dockerfile", "readme", "license", "changelog"):
+        return True
+    return ext in WORK_EXTENSIONS
+
+
+# --- Activity-window coalescing ---
+
+
+@dataclass
+class BurstState:
+    """Tracks the activity burst window for a single folder."""
+
+    active: bool = False
+    start_time: float = 0.0
+    last_change_time: float = 0.0
+    last_check_time: float = 0.0
+
+    def record_change(self, now: Optional[float] = None) -> None:
+        now = now or time.time()
+        if not self.active:
+            self.active = True
+            self.start_time = now
+        self.last_change_time = now
+
+    def reset(self) -> None:
+        self.active = False
+        self.start_time = 0.0
+        self.last_change_time = 0.0
+
+
+def should_sync(
+    state: BurstState,
+    quiet_threshold: int = 120,
+    max_burst: int = 1800,
+) -> bool:
+    """Determine if a sync should fire based on burst state.
+
+    Sync triggers when EITHER:
+    - No new changes for quiet_threshold seconds (burst ended naturally)
+    - Burst has been active for max_burst seconds (forced sync)
+    """
+    if not state.active:
+        return False
+
+    now = time.time()
+    quiet_elapsed = now - state.last_change_time
+    burst_elapsed = now - state.start_time
+
+    return quiet_elapsed >= quiet_threshold or burst_elapsed >= max_burst
+
+
+def scan_for_modifications(
+    folder: FolderMapping,
+    since: float,
+    filters: list[str],
+) -> bool:
+    """Check if any file in a folder tree has been modified since `since`.
+
+    Uses os.stat() only — no file content reading. Respects filter rules
+    to skip excluded directories.
+
+    Checks both file mtimes and directory mtimes. Directory mtime changes
+    when files are added, removed, or renamed — this catches structural
+    changes even when copied files preserve the original mtime (e.g.
+    GNOME Files copy-paste).
+    """
+    local_path = Path(folder.local_path)
+    if not local_path.is_dir():
+        return False
+
+    try:
+        for root, dirs, files in os.walk(local_path):
+            # Prune filtered directories from traversal
+            rel_root = Path(root).relative_to(local_path).as_posix()
+            dirs[:] = [
+                d for d in dirs
+                if not _matches_filter(d, filters)
+            ]
+
+            # Check directory mtime — catches file additions/deletions
+            # even when file mtimes are preserved
+            try:
+                if Path(root).stat().st_mtime > since:
+                    return True
+            except OSError:
+                pass
+
+            for filename in files:
+                if _matches_filter(filename, filters):
+                    continue
+                filepath = Path(root) / filename
+                try:
+                    if filepath.stat().st_mtime > since:
+                        return True
+                except OSError:
+                    continue
+    except (OSError, PermissionError):
+        pass
+
+    return False
+
+
+# --- Delete protection ---
+
+
+@dataclass
+class DeletedWorkFile:
+    """A work file that was deleted locally but exists on remote."""
+
+    path: str
+    remote_size: int
+
+
+def detect_local_deletions(
+    local_path: str,
+    remote_files: list[RemoteFileInfo],
+    filters: list[str],
+) -> tuple[list[DeletedWorkFile], list[str]]:
+    """Find work files deleted locally. Groups full-directory deletes.
+
+    Returns:
+        (deleted_work_files, deleted_work_dirs)
+        - deleted_work_files: individual files to protect
+        - deleted_work_dirs: directories where ALL contents are work files
+          that were deleted — these get a directory-level rename
+    """
+    local_base = Path(local_path)
+    deleted_files: list[DeletedWorkFile] = []
+
+    for rf in remote_files:
+        if rf.is_dir:
+            continue
+        # Skip files that match filter rules (they wouldn't be local anyway)
+        if _matches_filter(rf.path, filters):
+            continue
+
+        local_file = local_base / rf.path
+        if not local_file.exists() and is_work_file(rf.path):
+            deleted_files.append(DeletedWorkFile(path=rf.path, remote_size=rf.size))
+
+    # Group by parent directory to detect full-directory deletes
+    dir_deletes: dict[str, list[DeletedWorkFile]] = defaultdict(list)
+    for df in deleted_files:
+        parent = str(Path(df.path).parent)
+        if parent == ".":
+            continue  # root-level files handled individually
+        dir_deletes[parent].append(df)
+
+    # Check if every work file in a directory was deleted
+    deleted_work_dirs: list[str] = []
+    files_handled_by_dir: set[str] = set()
+
+    for dir_path, dir_deleted_files in dir_deletes.items():
+        # Count work files on remote in this directory
+        remote_work_in_dir = [
+            rf for rf in remote_files
+            if not rf.is_dir
+            and str(Path(rf.path).parent) == dir_path
+            and is_work_file(rf.path)
+        ]
+        local_dir = local_base / dir_path
+
+        if (
+            len(dir_deleted_files) == len(remote_work_in_dir)
+            and len(remote_work_in_dir) > 0
+            and not local_dir.exists()
+        ):
+            deleted_work_dirs.append(dir_path)
+            files_handled_by_dir.update(df.path for df in dir_deleted_files)
+
+    # Remove files that are handled at the directory level
+    individual_deleted = [
+        df for df in deleted_files
+        if df.path not in files_handled_by_dir
+    ]
+
+    return individual_deleted, deleted_work_dirs
+
+
+def protect_deleted_work_files(
+    remote_name: str,
+    remote_subpath: str,
+    deleted_files: list[DeletedWorkFile],
+    deleted_dirs: list[str],
+) -> list[str]:
+    """Rename-backup deleted work files/dirs on remote before bisync runs.
+
+    Format: file.py → file.py.2605311233  (YYMMDDHHmm)
+
+    Returns list of paths that were protected.
+    """
+    timestamp = datetime.now().strftime("%y%m%d%H%M")
+    protected: list[str] = []
+
+    # Directory-level renames first
+    for dir_path in deleted_dirs:
+        src = f"{remote_name}:{remote_subpath}/{dir_path}"
+        dst = f"{remote_name}:{remote_subpath}/{BACKUP_DIR_NAME}/{dir_path}.{timestamp}"
+        try:
+            rclone_moveto(src, dst)
+            protected.append(f"{dir_path}/ → {BACKUP_DIR_NAME}/{dir_path}.{timestamp}/")
+        except RcloneError:
+            # Fall through to individual file protection below
+            pass
+
+    # Individual file renames
+    for df in deleted_files:
+        src = f"{remote_name}:{remote_subpath}/{df.path}"
+        dst = f"{remote_name}:{remote_subpath}/{BACKUP_DIR_NAME}/{df.path}.{timestamp}"
+        try:
+            rclone_moveto(src, dst)
+            protected.append(f"{df.path} → {BACKUP_DIR_NAME}/{df.path}.{timestamp}")
+        except RcloneError:
+            pass  # best-effort — don't block sync for rename failures
+
+    return protected
+
+
+# --- Large change detection ---
+
+
+@dataclass
+class FlaggedChange:
+    """A file that changed significantly in size."""
+
+    path: str
+    local_size: int
+    remote_size: int
+    change_pct: float
+
+    def to_dict(self) -> dict:
+        return {
+            "path": self.path,
+            "local_size": self.local_size,
+            "remote_size": self.remote_size,
+            "change_pct": round(self.change_pct, 1),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> FlaggedChange:
+        return cls(
+            path=d["path"],
+            local_size=d["local_size"],
+            remote_size=d["remote_size"],
+            change_pct=d["change_pct"],
+        )
+
+
+def detect_suspicious_changes(
+    local_path: str,
+    remote_files: list[RemoteFileInfo],
+    config: AppConfig,
+) -> list[FlaggedChange]:
+    """Compare local vs remote file sizes. Flag changes exceeding threshold.
+
+    Only flags files larger than config.size_change_min_bytes that changed
+    by more than config.size_change_threshold (as a ratio).
+    """
+    local_base = Path(local_path)
+    flagged: list[FlaggedChange] = []
+
+    # Build remote size lookup
+    remote_sizes: dict[str, int] = {
+        rf.path: rf.size for rf in remote_files if not rf.is_dir
+    }
+
+    for rel_path, remote_size in remote_sizes.items():
+        if remote_size < config.size_change_min_bytes:
+            continue
+
+        local_file = local_base / rel_path
+        if not local_file.exists():
+            continue  # deletion, handled by delete protection
+
+        try:
+            local_size = local_file.stat().st_size
+        except OSError:
+            continue
+
+        if remote_size == 0:
+            continue
+
+        change_ratio = abs(local_size - remote_size) / remote_size
+        if change_ratio >= config.size_change_threshold:
+            flagged.append(FlaggedChange(
+                path=rel_path,
+                local_size=local_size,
+                remote_size=remote_size,
+                change_pct=change_ratio * 100,
+            ))
+
+    return flagged
+
+
+# --- Pending review management ---
+
+
+def write_pending_review(
+    config: AppConfig,
+    folder_path: str,
+    flagged: list[FlaggedChange],
+) -> None:
+    """Write flagged changes to pending_review.json, blocking sync for that folder."""
+    review_file = config.pending_review_file
+    existing = _load_pending_reviews(review_file)
+    existing[folder_path] = [f.to_dict() for f in flagged]
+    review_file.parent.mkdir(parents=True, exist_ok=True)
+    review_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+
+
+def read_pending_review(config: AppConfig) -> dict[str, list[FlaggedChange]]:
+    """Read all pending reviews. Returns {folder_path: [FlaggedChange]}."""
+    raw = _load_pending_reviews(config.pending_review_file)
+    return {
+        folder: [FlaggedChange.from_dict(d) for d in items]
+        for folder, items in raw.items()
+    }
+
+
+def has_pending_review(config: AppConfig, folder_path: str) -> bool:
+    """Check if a folder is blocked awaiting review."""
+    reviews = _load_pending_reviews(config.pending_review_file)
+    return folder_path in reviews and len(reviews[folder_path]) > 0
+
+
+def clear_pending_review(config: AppConfig, folder_path: str) -> None:
+    """Clear review for a specific folder, unblocking sync."""
+    review_file = config.pending_review_file
+    existing = _load_pending_reviews(review_file)
+    existing.pop(folder_path, None)
+    if existing:
+        review_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    elif review_file.exists():
+        review_file.unlink()
+
+
+def _load_pending_reviews(path: Path) -> dict:
+    """Load pending_review.json, returning empty dict if missing/corrupt."""
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+# --- Pre-sync orchestrator ---
+
+
+@dataclass
+class SafetyReport:
+    """Full pre-sync safety report."""
+
+    deleted_work_files: list[DeletedWorkFile] = field(default_factory=list)
+    deleted_work_dirs: list[str] = field(default_factory=list)
+    suspicious_changes: list[FlaggedChange] = field(default_factory=list)
+    protected_paths: list[str] = field(default_factory=list)
+
+    @property
+    def safe_to_sync(self) -> bool:
+        """False if there are suspicious changes requiring user review."""
+        return len(self.suspicious_changes) == 0
+
+    @property
+    def has_deletions(self) -> bool:
+        return len(self.deleted_work_files) > 0 or len(self.deleted_work_dirs) > 0
+
+
+def run_safety_checks(
+    folder: FolderMapping,
+    config: AppConfig,
+) -> SafetyReport:
+    """Full pre-sync safety check. Called before every bisync run.
+
+    1. Fetch remote file list (metadata only, no downloads)
+    2. Detect local deletions of work files
+    3. Detect suspicious large changes
+    4. Protect deleted work files (rename-backup on remote)
+
+    Returns a SafetyReport. If not safe_to_sync, the caller should
+    write a pending review and skip bisync.
+    """
+    report = SafetyReport()
+
+    try:
+        remote_files = rclone_lsjson(
+            config.remote_name, folder.remote_subpath, recursive=True,
+        )
+    except RcloneError:
+        # Can't reach remote — skip safety checks, bisync will fail anyway
+        return report
+
+    # Detect deletions
+    report.deleted_work_files, report.deleted_work_dirs = detect_local_deletions(
+        folder.local_path, remote_files, config.filters,
+    )
+
+    # Detect suspicious changes
+    report.suspicious_changes = detect_suspicious_changes(
+        folder.local_path, remote_files, config,
+    )
+
+    # Protect deleted work files on remote (rename-backup)
+    if report.has_deletions:
+        report.protected_paths = protect_deleted_work_files(
+            config.remote_name,
+            folder.remote_subpath,
+            report.deleted_work_files,
+            report.deleted_work_dirs,
+        )
+
+    return report
