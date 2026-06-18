@@ -20,6 +20,7 @@ from ..core.platform import is_linux, is_windows
 
 class ServiceLog(Log):
     """Log for service operations."""
+
     pass
 
 
@@ -40,15 +41,21 @@ class ServiceControlScreen(Screen):
             yield Label(" Service Control", classes="section-header")
             yield Label("")
 
-            backend = "systemd" if is_linux() else "Task Scheduler" if is_windows() else "unsupported"
+            backend = (
+                "systemd"
+                if is_linux()
+                else "Task Scheduler"
+                if is_windows()
+                else "unsupported"
+            )
             yield Label(f" Backend: {backend}")
 
             modes: list[str] = []
-            if self._config.has_bisync_folders():
-                modes.append("bisync")
-            if self._config.has_mount_folders():
-                modes.append("mount+pinner")
-            yield Label(f" Active modes: {', '.join(modes) if modes else 'none (add folders first)'}")
+            if self._config.has_enabled_folders():
+                modes.append("sync")
+            yield Label(
+                f" Active modes: {', '.join(modes) if modes else 'none (add folders first)'}"
+            )
             yield Label("")
 
             with Horizontal(classes="button-row"):
@@ -110,6 +117,7 @@ class ServiceControlScreen(Screen):
             is_service_enabled,
             ALL_SERVICE_NAMES,
         )
+
         for name in ALL_SERVICE_NAMES:
             status = service_status(name)
             load_state = status.get("LoadState", "unknown")
@@ -127,6 +135,7 @@ class ServiceControlScreen(Screen):
 
     def _show_windows_status(self) -> None:
         from ..service.windows import is_task_running, ALL_TASK_NAMES
+
         for name in ALL_TASK_NAMES:
             running = is_task_running(name)
             self._log(
@@ -137,6 +146,7 @@ class ServiceControlScreen(Screen):
         try:
             if is_linux():
                 from ..service.systemd import install_services
+
                 paths = install_services(self._config)
                 for p in paths:
                     self._log(f"Installed: {p}")
@@ -146,6 +156,7 @@ class ServiceControlScreen(Screen):
                     self._log("Services installed. Use 'Enable on login' + 'Start'.")
             elif is_windows():
                 from ..service.windows import install_tasks
+
                 paths = install_tasks(self._config)
                 for p in paths:
                     self._log(f"Task script: {p}")
@@ -157,10 +168,14 @@ class ServiceControlScreen(Screen):
         try:
             if is_linux():
                 from ..service.systemd import start_services
+
                 ok = start_services(self._config)
-                self._log("Services started." if ok else "Start failed \u2014 check logs.")
+                self._log(
+                    "Services started." if ok else "Start failed \u2014 check logs."
+                )
             elif is_windows():
                 from ..service.windows import start_task, ALL_TASK_NAMES
+
                 for name in ALL_TASK_NAMES:
                     start_task(name)
                 self._log("Tasks started.")
@@ -172,10 +187,12 @@ class ServiceControlScreen(Screen):
         try:
             if is_linux():
                 from ..service.systemd import stop_services
+
                 stop_services(self._config)
                 self._log("Services stopped.")
             elif is_windows():
                 from ..service.windows import stop_task, ALL_TASK_NAMES
+
                 for name in ALL_TASK_NAMES:
                     stop_task(name)
                 self._log("Tasks stopped.")
@@ -186,6 +203,7 @@ class ServiceControlScreen(Screen):
     def _do_enable(self) -> None:
         if is_linux():
             from ..service.systemd import enable_services
+
             ok = enable_services(self._config)
             self._log("Enabled on login." if ok else "Enable failed.")
         self._show_status()
@@ -193,14 +211,20 @@ class ServiceControlScreen(Screen):
     def _do_disable(self) -> None:
         if is_linux():
             from ..service.systemd import disable_services
+
             disable_services(self._config)
             self._log("Disabled.")
         self._show_status()
 
     def _do_uninstall(self) -> None:
         if is_linux():
-            from ..service.systemd import stop_services, disable_services, _user_unit_dir
+            from ..service.systemd import (
+                stop_services,
+                disable_services,
+                _user_unit_dir,
+            )
             from ..service.systemd import ALL_SERVICE_NAMES
+
             stop_services(self._config)
             disable_services(self._config)
             unit_dir = _user_unit_dir()
@@ -212,6 +236,7 @@ class ServiceControlScreen(Screen):
             self._log("Services uninstalled.")
         elif is_windows():
             from ..service.windows import remove_tasks
+
             remove_tasks()
             self._log("Tasks removed.")
 

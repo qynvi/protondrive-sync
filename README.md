@@ -1,74 +1,57 @@
 # ProtonDrive Sync
 
-TUI management tool for syncing local folders to Proton Drive via rclone. Supports bidirectional sync (bisync) and FUSE mount modes with adaptive timing, safety checks, and git repo rehydration.
+Textual TUI and background daemon for syncing selected work folders to Proton Drive using the official Proton Drive CLI.
+
+The app is designed for "work relevant" trees, including folders with multiple git repos. It filters out common dependency/build/cache/metadata artifacts and keeps local-file safety as the highest priority.
 
 ## Features
 
-- **Bisync** (default): Bidirectional sync via `rclone bisync` — local directory stays as-is, no symlinks
-- **Mount mode** (alternative): FUSE mount with VFS caching, symlink from local path to mount point
-- **Adaptive sync timing**: Activity-window coalescing — 15s check interval, 120s quiet threshold, 30min max burst
-- **Delete protection**: Deleted work files backed up to `.protondrive-sync-backups/` on remote with timestamp suffix
-- **Suspicious change detection**: Blocks sync when >50% size change on >10KB files until user approves in TUI
-- **Git rehydration**: Scans synced folders for git metadata, reconnects repos on new devices (clone, fetch, branch tracking, submodules)
-- **Low-footprint mode**: Single toggle — limits CPU (transfers=1, checkers=1, nice=19) and bandwidth (2M up / 10M down)
-- **Follow symlinks**: `--copy-links` on by default, configurable in Settings
-- **Filter rules**: `.git/`, `node_modules/`, `__pycache__/`, etc. excluded from sync
-- **Instance locking**: Only one TUI window at a time (flock-based, auto-releases on crash)
-- **Cross-platform**: Python — works on aarch64 and x86_64, Linux and Windows
+- **CLI-backed bidirectional sync**: Uses the official `proton-drive` CLI for upload, download, list, trash, and metadata operations.
+- **Targeted sync engine**: Scans local changes, polls the app journal, and syncs only paths that changed instead of running full-tree sync every cycle.
+- **Metadata verification**: Verifies transfers with Proton's plaintext `claimedSize`, `claimedDigests.sha1`, and `claimedModificationTime` metadata.
+- **Safe remote deletes**: Remote removals go to Proton Drive trash, not permanent delete.
+- **Local overwrite protection**: Local paths are backed up into `.protondrive-sync-backups/` before destructive local changes.
+- **Initial setup safety**: Empty-local downloads are staged and verified before publishing; uploads skip already-matching files on retry and fail on mismatches.
+- **Git metadata support**: Scans synced folders for git metadata and supports rehydrating repos on new machines.
+- **Symlink modes**: Preserve symlinks as `.rclonelink` metadata blobs, copy targets, or skip links.
+- **Filters**: Excludes `.git/`, `node_modules/`, `__pycache__/`, build artifacts, caches, and other noisy data by default.
+- **Background daemon**: User-level systemd service on Linux or Task Scheduler on Windows.
+
+Mount/FUSE mode and rclone are no longer used.
 
 ## Prerequisites
 
-- **Python 3.11+**
-- **rclone v1.62+** (Proton Drive backend added in 1.62; Ubuntu apt is too old — install from rclone.org)
-- **FUSE** (only for mount mode): `fuse3` on Linux, WinFsp on Windows
+- Python 3.11+
+- Proton Drive CLI authentication: `vendor/proton-drive-cli/proton-drive auth login`
+
+The installer vendors the pinned Proton Drive CLI binary into `vendor/proton-drive-cli/proton-drive` using `scripts/install-proton-cli.sh`.
 
 ## Installation
 
-### 1. Install rclone
-
-```bash
-# ARM64
-curl -L -O https://downloads.rclone.org/current/rclone-current-linux-arm64.deb
-sudo dpkg -i rclone-current-linux-arm64.deb
-
-# x86_64
-curl -L -O https://downloads.rclone.org/current/rclone-current-linux-amd64.deb
-sudo dpkg -i rclone-current-linux-amd64.deb
-
-# Any platform
-curl https://rclone.org/install.sh | sudo bash
-```
-
-### 2. Configure rclone
-
-```bash
-rclone config
-# Create remote: type 'protondrive', name it 'proton'
-# Verify: rclone lsd proton:
-```
-
-**Password with special characters:** Use `rclone obscure 'YourP@ss!'` and edit `~/.config/rclone/rclone.conf` directly.
-
-**2FA:** Enter the base32 TOTP seed (e.g. `ABCDEFGHIJKLMNOP`), not a 6-digit code.
-
-### 3. Install the app
-
 ```bash
 ./install.sh
-# Creates venv, installs deps, icon, and .desktop launcher
+```
+
+This creates `.venv/`, installs the package, downloads/verifies the Proton Drive CLI if needed, installs the icon, and creates the desktop launcher.
+
+If you already downloaded the CLI manually, you can install it into the app vendor directory with checksum verification:
+
+```bash
+scripts/install-proton-cli.sh --from ~/Desktop/proton-drive
 ```
 
 ## Usage
 
-Launch via desktop shortcut or `./launch.sh` or `.venv/bin/protondrive-sync`.
+Launch via desktop shortcut, `./launch.sh`, or `.venv/bin/protondrive-sync`.
 
-### First-time setup
+First-time flow:
 
-1. `s` (Settings) — set remote name to match your rclone config
-2. `a` (Add folder) — map a local directory to Proton Drive
-3. `d` (Service) — install and start the background sync daemon
+1. Authenticate once: `vendor/proton-drive-cli/proton-drive auth login`
+2. Launch the TUI.
+3. Press `a` to add a folder mapping.
+4. Press `d` to install/start the background daemon.
 
-### Keyboard shortcuts
+Keyboard shortcuts:
 
 | Key | Action |
 |-----|--------|
@@ -77,88 +60,65 @@ Launch via desktop shortcut or `./launch.sh` or `.venv/bin/protondrive-sync`.
 | `r` | Remove folder |
 | `g` | Git rehydration |
 | `v` | Review flagged changes |
+| `y` | Manual verify |
 | `l` | Live daemon logs |
-| `p` | Pin settings (mount mode) |
 | `d` | Service control |
 | `s` | Settings |
 | `f` | Refresh |
 | `q` | Quit |
 
-### Adding a folder
+## Adding A Folder
 
-Provide a local path and remote subpath. The local directory name is auto-appended:
+Provide a local path and a remote subpath under Proton Drive `/my-files`.
 
-`/home/user/notes` + remote `workspace` → `proton:workspace/notes`
+Examples:
 
-Path inputs have ghost-text autocomplete. Press Browse for modal directory browsers.
+- Local `/home/user/work/project-a`
+- Remote subpath `workspace/project-a`
+- CLI path used internally: `/my-files/workspace/project-a`
+
+Setup cases:
+
+- Local has data, remote missing/empty: upload local files, verify metadata, seed baseline.
+- Local empty/missing, remote has data: download into a sibling temp directory, verify metadata, then publish local folder.
+- Both have unrelated data: blocked for review rather than merged automatically.
 
 ## Configuration
 
-Stored at `~/.config/protondrive-sync/config.json`.
+Config lives at `~/.config/protondrive-sync/config.json`.
+
+Common settings:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `remote_name` | `protondrive` | rclone remote name |
-| `mount_point` | `~/ProtonDrive` | FUSE mount location (mount mode) |
-| `transfers` | `8` | Concurrent transfer streams |
-| `checkers` | `16` | Concurrent integrity checkers |
-| `copy_links` | `true` | Follow symlinks (`--copy-links`) |
-| `low_footprint` | `false` | Limit CPU + bandwidth |
-| `bisync_check_interval` | `15` | Seconds between modification scans |
-| `bisync_quiet_threshold` | `120` | Seconds of quiet before sync fires |
-| `bisync_max_burst` | `1800` | Max seconds to coalesce before forced sync |
-| `size_change_threshold` | `0.5` | Flag files with >50% size change |
-| `size_change_min_bytes` | `10240` | Only flag files >10KB |
-| `filters` | see below | rclone filter rules |
+| `proton_cli_path` | `null` | Optional explicit CLI binary path override |
+| `proton_cli_concurrency` | `4` | Parallel CLI invocations for remote walks |
+| `symlink_mode` | `preserve` | `preserve`, `copy`, or `skip` |
+| `bisync_check_interval` | `15` | Seconds between local modification scans |
+| `bisync_quiet_threshold` | `120` | Quiet seconds before a sync fires |
+| `bisync_max_burst` | `1800` | Max coalescing window |
+| `filters` | built-in defaults | App-side include/exclude rules |
 
 ## Architecture
 
-```
-protondrive-sync/
-├── src/protondrive_sync/
-│   ├── app.py                # Textual App, instance locking, CSS
-│   ├── bisync_main.py        # Adaptive sync daemon (systemd)
-│   ├── pinner_main.py        # Cache pinner daemon (mount mode)
-│   ├── core/
-│   │   ├── config.py         # AppConfig, FolderMapping, JSON persistence
-│   │   ├── platform.py       # OS detection, XDG paths, instance lock
-│   │   ├── rclone.py         # rclone subprocess wrapper
-│   │   ├── bisync.py         # Delete protection, change detection, coalescing
-│   │   ├── migration.py      # Upload, verify, bisync init, mount migration
-│   │   ├── git_meta.py       # Git scanning, metadata, rehydration
-│   │   ├── suggesters.py     # Path autocomplete for Input widgets
-│   │   ├── symlinks.py       # Symlink/junction management
-│   │   └── pinner.py         # Background cache pinning
-│   ├── screens/
-│   │   ├── main.py           # Folder table, status dashboard
-│   │   ├── add_folder.py     # Add/edit folder with migration
-│   │   ├── settings.py       # Global settings
-│   │   ├── service_control.py
-│   │   ├── logs.py           # Live daemon log viewer
-│   │   ├── rehydrate.py      # Git rehydration
-│   │   ├── review.py         # Flagged changes review
-│   │   ├── path_browser.py   # Local/remote directory browser
-│   │   ├── pin_settings.py   # Per-folder cache pinning
-│   │   └── confirm.py        # Confirmation dialog
-│   └── service/
-│       ├── systemd.py        # systemd unit generation
-│       └── windows.py        # Windows Task Scheduler
-├── tests/                    # 165 tests
-├── resources/
-│   └── protondrive-sync.svg
-├── install.sh
-├── launch.sh                 # Terminal resize wrapper
-└── pyproject.toml
-```
+Key modules:
+
+- `core/proton_cli.py`: subprocess wrapper for the Proton Drive CLI; path mapping, JSON parsing, trash, upload/download, metadata extraction.
+- `core/sync_engine.py`: targeted bidirectional sync planner/executor and inventory/journal updates.
+- `core/migration.py`: initial setup and metadata baseline seeding.
+- `core/inventory.py`: SQLite inventory of last verified local/remote state.
+- `core/journal.py`: app-owned remote journal for multi-machine coordination.
+- `core/verify.py`: metadata-based subtree verification.
+- `bisync_main.py`: adaptive daemon loop.
+- `service/systemd.py`: Linux user-service generation.
 
 ## Troubleshooting
 
-- **"rclone not found"**: Install from https://rclone.org/install/ (not apt)
-- **"Incorrect login credentials"**: Re-run `rclone config`. For special chars in password, use `rclone obscure`
-- **"Decoding of secret as base32 failed"**: Enter the TOTP seed, not a 6-digit code
-- **"draft already exists" (error 2501)**: App handles this with `--protondrive-replace-existing-draft`
-- **Desktop icon missing**: Right-click > Allow Launching. Log out/in to refresh icon cache
-- **Another instance running**: TUI shows the holder PID and offers to kill it
+- **CLI not found**: Run `scripts/install-proton-cli.sh`.
+- **Not authenticated**: Run `vendor/proton-drive-cli/proton-drive auth login` from your user session.
+- **Daemon auth issue**: The CLI was validated under `systemd --user`; restart the user service after login if credentials expire.
+- **Unexpected sync block**: Check pending review (`v`) or daemon logs (`l`). The app blocks uncertain local/remote conflicts instead of overwriting.
+- **Need remote recovery**: Remote deletes/replaces are recoverable from Proton Drive trash/version history.
 
 ## License
 

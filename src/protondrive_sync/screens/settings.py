@@ -1,4 +1,4 @@
-"""Global settings screen — bisync timing, safety thresholds, mount settings, filters."""
+"""Global settings screen — bisync timing, safety thresholds, filters."""
 
 from __future__ import annotations
 
@@ -12,12 +12,20 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    Select,
     Switch,
     TextArea,
 )
 
-from ..core.config import AppConfig, save_config, write_filter_file
-from ..core.platform import is_linux
+from ..core.config import (
+    AppConfig,
+    INTEGRITY_MODES,
+    SYMLINK_MODE_LABELS,
+    SYMLINK_MODES,
+    normalize_symlink_mode,
+    save_config,
+    write_filter_file,
+)
 
 
 class SettingsScreen(Screen):
@@ -37,22 +45,25 @@ class SettingsScreen(Screen):
             yield Label(" Settings", classes="section-header")
             yield Label("")
 
-            yield Label(" Remote name:")
-            yield Input(value=self._config.remote_name, id="remote-name")
-
-            yield Label("")
             yield Label(" Bisync Timing:", classes="section-header")
 
             with Horizontal():
                 with Vertical():
                     yield Label(" Check interval (sec):")
-                    yield Input(value=str(self._config.bisync_check_interval), id="bisync-check")
+                    yield Input(
+                        value=str(self._config.bisync_check_interval), id="bisync-check"
+                    )
                 with Vertical():
                     yield Label(" Quiet threshold (sec):")
-                    yield Input(value=str(self._config.bisync_quiet_threshold), id="bisync-quiet")
+                    yield Input(
+                        value=str(self._config.bisync_quiet_threshold),
+                        id="bisync-quiet",
+                    )
                 with Vertical():
                     yield Label(" Max burst (sec):")
-                    yield Input(value=str(self._config.bisync_max_burst), id="bisync-burst")
+                    yield Input(
+                        value=str(self._config.bisync_max_burst), id="bisync-burst"
+                    )
 
             yield Label("")
             yield Label(" Safety Thresholds:", classes="section-header")
@@ -76,58 +87,71 @@ class SettingsScreen(Screen):
 
             with Horizontal():
                 with Vertical():
-                    yield Label(" Transfers:")
-                    yield Input(value=str(self._config.transfers), id="transfers")
-                with Vertical():
-                    yield Label(" Pin interval (min):")
-                    yield Input(value=str(self._config.pin_interval_minutes), id="pin-interval")
+                    yield Label(" CLI concurrency:")
+                    yield Input(
+                        value=str(self._config.proton_cli_concurrency),
+                        id="cli-concurrency",
+                    )
 
             yield Label("")
             with Horizontal():
                 yield Label(" Low-footprint mode: ")
                 yield Switch(value=self._config.low_footprint, id="low-footprint")
             yield Label(
-                " [dim]Limits CPU (transfers=1, checkers=1, nice=19) and "
-                "network (2M up / 10M down). Restarts services on change.[/]"
+                " [dim]Runs the daemon with low OS priority. Restarts services on change.[/]"
             )
 
             yield Label("")
+            yield Label(" Targeted Sync:", classes="section-header")
             with Horizontal():
-                yield Label(" Follow symlinks: ")
-                yield Switch(value=self._config.copy_links, id="copy-links")
+                yield Label(" Enable targeted P3 sync: ")
+                yield Switch(
+                    value=self._config.targeted_sync_enabled, id="targeted-sync"
+                )
+            with Horizontal():
+                with Vertical():
+                    yield Label(" Integrity mode:")
+                    yield Select(
+                        [(mode.replace("_", " "), mode) for mode in INTEGRITY_MODES],
+                        value=self._config.integrity_mode,
+                        allow_blank=False,
+                        id="integrity-mode",
+                    )
+                with Vertical():
+                    yield Label(" Journal poll (sec):")
+                    yield Input(
+                        value=str(self._config.journal_poll_interval_seconds),
+                        id="journal-poll",
+                    )
+                with Vertical():
+                    yield Label(" Audit budget (min):")
+                    yield Input(
+                        value=str(self._config.remote_audit_time_budget_minutes),
+                        id="audit-budget",
+                    )
+                with Vertical():
+                    yield Label(" Backup retention (days):")
+                    yield Input(
+                        value=str(self._config.backup_retention_days),
+                        id="backup-retention",
+                    )
+
+            yield Label("")
+            with Horizontal():
+                yield Label(" Default symlink mode: ")
+                yield Select(
+                    [(SYMLINK_MODE_LABELS[mode], mode) for mode in SYMLINK_MODES],
+                    value=self._config.symlink_mode,
+                    allow_blank=False,
+                    id="symlink-mode",
+                )
             yield Label(
-                " [dim]Dereference symlinks inside sync folders and sync their "
-                "target content as regular files (--copy-links).[/]"
+                " [dim]New sync folders default to preserving symlinks as link "
+                "metadata blobs, not traversing target content.[/]"
             )
 
             yield Label("")
-            yield Label(" Mount Mode Settings:", classes="section-header")
-            yield Label(" [dim]These only affect mount-mode folders, not bisync.[/]")
-
-            yield Label(" Mount point:")
-            yield Input(value=self._config.mount_point, id="mount-point")
-
-            with Horizontal():
-                with Vertical():
-                    yield Label(" Max cache size:")
-                    yield Input(value=self._config.cache_max_size, id="cache-size")
-                with Vertical():
-                    yield Label(" Max cache age:")
-                    yield Input(value=self._config.cache_max_age, id="cache-age")
-
-            with Horizontal():
-                with Vertical():
-                    yield Label(" Poll interval:")
-                    yield Input(value=self._config.poll_interval, id="poll-interval")
-                with Vertical():
-                    yield Label(" Write-back delay:")
-                    yield Input(value=self._config.write_back, id="write-back")
-
-            yield Label(" Dir cache time:")
-            yield Input(value=self._config.dir_cache_time, id="dir-cache-time")
-
-            yield Label("")
-            yield Label(" Filter rules (one per line, rclone filter syntax):")
+            yield Label(" Filter rules (one per line):")
             yield TextArea(
                 "\n".join(self._config.filters),
                 id="filters",
@@ -151,21 +175,28 @@ class SettingsScreen(Screen):
         try:
             prev_low_footprint = self._config.low_footprint
 
-            self._config.remote_name = self.query_one("#remote-name", Input).value.strip()
-            self._config.mount_point = self.query_one("#mount-point", Input).value.strip()
-            self._config.cache_max_size = self.query_one("#cache-size", Input).value.strip()
-            self._config.cache_max_age = self.query_one("#cache-age", Input).value.strip()
-            self._config.poll_interval = self.query_one("#poll-interval", Input).value.strip()
-            self._config.write_back = self.query_one("#write-back", Input).value.strip()
-            self._config.dir_cache_time = self.query_one("#dir-cache-time", Input).value.strip()
-            self._config.pin_interval_minutes = int(
-                self.query_one("#pin-interval", Input).value.strip()
-            )
-            self._config.transfers = int(
-                self.query_one("#transfers", Input).value.strip()
+            self._config.proton_cli_concurrency = int(
+                self.query_one("#cli-concurrency", Input).value.strip()
             )
             self._config.low_footprint = self.query_one("#low-footprint", Switch).value
-            self._config.copy_links = self.query_one("#copy-links", Switch).value
+            self._config.targeted_sync_enabled = self.query_one(
+                "#targeted-sync", Switch
+            ).value
+            self._config.integrity_mode = str(
+                self.query_one("#integrity-mode", Select).value
+            )
+            self._config.journal_poll_interval_seconds = int(
+                self.query_one("#journal-poll", Input).value.strip()
+            )
+            self._config.remote_audit_time_budget_minutes = int(
+                self.query_one("#audit-budget", Input).value.strip()
+            )
+            self._config.backup_retention_days = int(
+                self.query_one("#backup-retention", Input).value.strip()
+            )
+            self._config.symlink_mode = normalize_symlink_mode(
+                str(self.query_one("#symlink-mode", Select).value)
+            )
 
             # Bisync timing
             self._config.bisync_check_interval = int(
@@ -218,9 +249,9 @@ class SettingsScreen(Screen):
                     stop_services,
                     ALL_SERVICE_NAMES,
                 )
+
                 active_before = {
-                    name for name in ALL_SERVICE_NAMES
-                    if is_service_active(name)
+                    name for name in ALL_SERVICE_NAMES if is_service_active(name)
                 }
                 if active_before:
                     stop_services(self._config)
@@ -230,7 +261,9 @@ class SettingsScreen(Screen):
                 mode = "on" if self._config.low_footprint else "off"
                 self.notify(f"Low-footprint {mode} \u2014 services restarted.")
             else:
-                self.notify("Service restart not supported on this platform. Restart manually.")
+                self.notify(
+                    "Service restart not supported on this platform. Restart manually."
+                )
         except Exception as exc:
             self.notify(f"Service restart failed: {exc}", severity="error")
 

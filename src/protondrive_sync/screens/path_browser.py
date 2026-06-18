@@ -93,14 +93,17 @@ class LocalBrowserScreen(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(id="local-browser-dialog"):
             yield Label("Browse Local Directory", classes="browser-header")
-            yield Label(f"  {self._selected}", classes="current-path", id="path-display")
+            yield Label(
+                f"  {self._selected}", classes="current-path", id="path-display"
+            )
             yield DirectoryOnlyTree(str(self._start))
             with Horizontal(classes="button-row"):
                 yield Button("Select", id="select-btn", variant="primary")
                 yield Button("Cancel", id="cancel-btn")
 
     def on_directory_tree_directory_selected(
-        self, event: DirectoryTree.DirectorySelected,
+        self,
+        event: DirectoryTree.DirectorySelected,
     ) -> None:
         """Update current selection when a directory is clicked/entered."""
         self._selected = str(event.path)
@@ -130,7 +133,7 @@ class LocalBrowserScreen(ModalScreen[str]):
 class RemoteBrowserScreen(ModalScreen[str]):
     """Modal for browsing remote directories via a list view.
 
-    Fetches directory listings from rclone on demand, with caching.
+    Fetches directory listings from Proton Drive on demand, with caching.
     Navigation is breadcrumb-style: select a dir to enter, '..' to go up.
 
     Returns the selected remote path as a string, or empty string on cancel.
@@ -177,9 +180,8 @@ class RemoteBrowserScreen(ModalScreen[str]):
     }
     """
 
-    def __init__(self, remote_name: str, start_path: str = "") -> None:
+    def __init__(self, start_path: str = "") -> None:
         super().__init__()
-        self._remote_name = remote_name
         self._current_path = start_path.strip("/")
         # Cache: path -> list of dir names
         self._dir_cache: dict[str, list[str]] = {}
@@ -189,11 +191,11 @@ class RemoteBrowserScreen(ModalScreen[str]):
         display_path = self._current_path or "/"
         with Vertical(id="remote-browser-dialog"):
             yield Label(
-                f"Browse Remote: {self._remote_name}",
+                "Browse Remote: Proton Drive",
                 classes="browser-header",
             )
             yield Label(
-                f"  {self._remote_name}:/{display_path}",
+                f"  Proton Drive:/{display_path}",
                 classes="current-path",
                 id="remote-path-display",
             )
@@ -223,8 +225,14 @@ class RemoteBrowserScreen(ModalScreen[str]):
         if path in self._dir_cache:
             dirs = self._dir_cache[path]
         else:
-            from ..core.rclone import list_remote_dirs
-            dirs = list_remote_dirs(self._remote_name, path)
+            from ..core.config import load_config
+            from ..core.proton_cli import ProtonDriveCLI
+
+            dirs = [
+                node.name
+                for node in ProtonDriveCLI(load_config()).list_dir(path)
+                if node.is_dir and node.name
+            ]
             self._dir_cache[path] = dirs
 
         # Switch back to UI thread to update widgets
@@ -253,7 +261,7 @@ class RemoteBrowserScreen(ModalScreen[str]):
         display_path = self._current_path or "/"
         try:
             self.query_one("#remote-path-display", Label).update(
-                f"  {self._remote_name}:/{display_path}"
+                f"  Proton Drive:/{display_path}"
             )
         except Exception:
             pass
@@ -265,7 +273,8 @@ class RemoteBrowserScreen(ModalScreen[str]):
             pass
 
     def on_option_list_option_selected(
-        self, event: OptionList.OptionSelected,
+        self,
+        event: OptionList.OptionSelected,
     ) -> None:
         """Navigate into a subdirectory on selection."""
         if self._loading:

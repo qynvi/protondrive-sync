@@ -5,8 +5,8 @@ and branch info in a metadata file that rides along with synced content.
 On a new machine, reads the metadata and rehydrates repos by cloning
 from their recorded remotes.
 
-The metadata file (.protondrive-sync.json) is NOT in the rclone filter
-list, so it syncs normally. The .git/ directory IS filtered, so
+The metadata file (.protondrive-sync.json) is NOT excluded by default app
+filters, so it syncs normally. The .git/ directory IS filtered, so
 rehydration recreates it from git remotes rather than from sync.
 """
 
@@ -32,6 +32,7 @@ LogCallback = Callable[[str], None]
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class GitRepoInfo:
@@ -70,7 +71,9 @@ def git_available() -> bool:
     try:
         subprocess.run(
             ["git", "--version"],
-            capture_output=True, timeout=5, check=False,
+            capture_output=True,
+            timeout=5,
+            check=False,
         )
         _git_available_cache = True
     except (FileNotFoundError, OSError):
@@ -81,6 +84,7 @@ def git_available() -> bool:
 # ---------------------------------------------------------------------------
 # Git helpers (subprocess wrappers)
 # ---------------------------------------------------------------------------
+
 
 def _git(args: list[str], cwd: Path, timeout: int = 30) -> subprocess.CompletedProcess:
     """Run a git command, returning the CompletedProcess."""
@@ -136,6 +140,7 @@ def _git_has_submodules(repo_path: Path) -> bool:
 # Scanning
 # ---------------------------------------------------------------------------
 
+
 def _should_skip_dir(dir_name: str, filters: list[str]) -> bool:
     """Check if a directory should be skipped during git repo scanning.
 
@@ -173,10 +178,7 @@ def scan_git_repos(
         current = Path(dirpath)
 
         # Prune filtered directories (modify dirnames in-place)
-        dirnames[:] = [
-            d for d in dirnames
-            if not _should_skip_dir(d, filters)
-        ]
+        dirnames[:] = [d for d in dirnames if not _should_skip_dir(d, filters)]
 
         # Check if this directory is a git repo
         git_dir = current / ".git"
@@ -198,13 +200,15 @@ def scan_git_repos(
             commit = _git_commit(current)
             has_submodules = _git_has_submodules(current)
 
-            repos.append(GitRepoInfo(
-                relative_path=rel,
-                remotes=remotes,
-                branch=branch,
-                commit=commit,
-                has_submodules=has_submodules,
-            ))
+            repos.append(
+                GitRepoInfo(
+                    relative_path=rel,
+                    remotes=remotes,
+                    branch=branch,
+                    commit=commit,
+                    has_submodules=has_submodules,
+                )
+            )
 
     repos.sort(key=lambda r: r.relative_path)
     return repos
@@ -213,6 +217,7 @@ def scan_git_repos(
 # ---------------------------------------------------------------------------
 # Metadata I/O
 # ---------------------------------------------------------------------------
+
 
 def _meta_path(local_path: Path) -> Path:
     """Path to the metadata file within a sync directory."""
@@ -238,13 +243,15 @@ def _deserialize_meta(text: str) -> SyncMeta:
     data = json.loads(text)
     repos = []
     for r in data.get("git_repos", []):
-        repos.append(GitRepoInfo(
-            relative_path=r.get("relative_path", "."),
-            remotes=r.get("remotes", {}),
-            branch=r.get("branch", ""),
-            commit=r.get("commit", ""),
-            has_submodules=r.get("has_submodules", False),
-        ))
+        repos.append(
+            GitRepoInfo(
+                relative_path=r.get("relative_path", "."),
+                remotes=r.get("remotes", {}),
+                branch=r.get("branch", ""),
+                commit=r.get("commit", ""),
+                has_submodules=r.get("has_submodules", False),
+            )
+        )
     return SyncMeta(
         version=data.get("version", 1),
         generated_at=data.get("generated_at", ""),
@@ -337,6 +344,7 @@ def read_metadata(local_path: Path) -> Optional[SyncMeta]:
 # Rehydration status
 # ---------------------------------------------------------------------------
 
+
 def check_rehydration_status(
     local_path: Path,
     repos: list[GitRepoInfo],
@@ -374,6 +382,7 @@ def rehydration_summary(
 # ---------------------------------------------------------------------------
 # Rehydration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RehydrationResult:
@@ -513,7 +522,9 @@ def rehydrate_repo(
             continue
         result = _git(["remote", "add", name, fetch_url], cwd=repo_path)
         if result.returncode != 0:
-            _log(f"  {rel_display}: warning: failed to add remote '{name}': {result.stderr.strip()}")
+            _log(
+                f"  {rel_display}: warning: failed to add remote '{name}': {result.stderr.strip()}"
+            )
 
     _log(f"  {rel_display}: remotes configured ({', '.join(repo.remotes.keys())})")
 
@@ -535,7 +546,9 @@ def rehydrate_repo(
         check = _git(["rev-parse", "--verify", ref], cwd=repo_path)
         if check.returncode != 0:
             # Branch doesn't exist on remote — try finding default branch
-            _log(f"  {rel_display}: branch '{branch}' not found on '{primary_remote}', trying default ...")
+            _log(
+                f"  {rel_display}: branch '{branch}' not found on '{primary_remote}', trying default ..."
+            )
             fallback = _find_default_branch(repo_path, primary_remote)
             if fallback:
                 _log(f"  {rel_display}: falling back to '{fallback}'")
@@ -567,7 +580,9 @@ def rehydrate_repo(
                 _git(["reset", repo.commit], cwd=repo_path)
                 _log(f"  {rel_display}: HEAD -> {repo.commit[:12]} (detached)")
             else:
-                _log(f"  {rel_display}: warning: recorded commit {repo.commit[:12]} not found")
+                _log(
+                    f"  {rel_display}: warning: recorded commit {repo.commit[:12]} not found"
+                )
         else:
             _log(f"  {rel_display}: warning: no branch or commit recorded")
 
@@ -582,7 +597,9 @@ def rehydrate_repo(
         if result.returncode == 0:
             _log(f"  {rel_display}: submodules initialized")
         else:
-            _log(f"  {rel_display}: warning: submodule init failed: {result.stderr.strip()}")
+            _log(
+                f"  {rel_display}: warning: submodule init failed: {result.stderr.strip()}"
+            )
             # Don't fail the whole rehydration — submodule issues are non-fatal
 
     # 7. Exclude metadata file from git status
@@ -591,7 +608,9 @@ def rehydrate_repo(
     return RehydrationResult(
         relative_path=repo.relative_path,
         success=True,
-        message=f"Rehydrated on branch '{branch}'" if branch else f"Rehydrated at {repo.commit[:12]}",
+        message=f"Rehydrated on branch '{branch}'"
+        if branch
+        else f"Rehydrated at {repo.commit[:12]}",
     )
 
 
@@ -608,11 +627,13 @@ def rehydrate_all(
     _log = log or (lambda _: None)
 
     if not git_available():
-        return [RehydrationResult(
-            relative_path="*",
-            success=False,
-            message="git is not installed on this system",
-        )]
+        return [
+            RehydrationResult(
+                relative_path="*",
+                success=False,
+                message="git is not installed on this system",
+            )
+        ]
 
     if not meta.git_repos:
         return []
@@ -628,6 +649,7 @@ def rehydrate_all(
 # ---------------------------------------------------------------------------
 # Convenience: scan + write in one call
 # ---------------------------------------------------------------------------
+
 
 def refresh_git_metadata(
     local_path: Path,

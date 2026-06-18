@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "protondrive-sync"
 version = "0.1.0"
-description = "TUI management tool for syncing local folders to Proton Drive via rclone"
+description = "TUI management tool for syncing local folders to Proton Drive via the Proton Drive CLI"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [

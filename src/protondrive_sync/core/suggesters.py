@@ -1,4 +1,4 @@
-"""Path suggesters for Input widgets — local filesystem and remote rclone paths."""
+"""Path suggesters for Input widgets — local filesystem and Proton Drive paths."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ class LocalPathSuggester(Suggester):
 
 
 class RemotePathSuggester(Suggester):
-    """Suggests remote directory paths from rclone lsjson results.
+    """Suggests remote directory paths from Proton Drive CLI list results.
 
     Caches directory listings to avoid repeated API calls. The cache
     is populated on first access and when the user navigates to a new
@@ -92,9 +92,8 @@ class RemotePathSuggester(Suggester):
     Provides ghost-text inline completion for remote subpaths.
     """
 
-    def __init__(self, remote_name: str) -> None:
+    def __init__(self) -> None:
         super().__init__(use_cache=False, case_sensitive=True)
-        self._remote_name = remote_name
         # Cache: parent_path -> list of child dir names
         self._dir_cache: dict[str, list[str]] = {}
 
@@ -141,8 +140,14 @@ class RemotePathSuggester(Suggester):
             return self._dir_cache[path]
 
         try:
-            from .rclone import list_remote_dirs
-            dirs = list_remote_dirs(self._remote_name, path)
+            from .config import load_config
+            from .proton_cli import ProtonDriveCLI
+
+            dirs = [
+                node.name
+                for node in ProtonDriveCLI(load_config()).list_dir(path)
+                if node.is_dir and node.name
+            ]
             self._dir_cache[path] = sorted(dirs)
             return self._dir_cache[path]
         except Exception:

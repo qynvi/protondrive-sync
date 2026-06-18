@@ -65,9 +65,47 @@ def get_log_dir() -> Path:
     return log_dir
 
 
-def find_rclone() -> str | None:
-    """Find the rclone binary. Returns path or None."""
-    return shutil.which("rclone")
+def repo_root() -> Path | None:
+    """Return the application repo root for source/editable installs."""
+    candidate = Path(__file__).resolve().parents[3]
+    if (candidate / "pyproject.toml").exists():
+        return candidate
+    return None
+
+
+def find_proton_cli(explicit_path: str | None = None) -> str | None:
+    """Locate the Proton Drive CLI binary.
+
+    Resolution order:
+    1. explicit configured path (config.proton_cli_path)
+    2. vendored binary installed by scripts/install-proton-cli.sh
+    3. PATH lookup
+    4. conventional user locations
+    """
+    binary_name = "proton-drive.exe" if is_windows() else "proton-drive"
+
+    if explicit_path:
+        candidate = Path(explicit_path).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    root = repo_root()
+    if root is not None:
+        vendored = root / "vendor" / "proton-drive-cli" / binary_name
+        if vendored.is_file() and os.access(vendored, os.X_OK):
+            return str(vendored)
+
+    on_path = shutil.which("proton-drive")
+    if on_path:
+        return on_path
+
+    for candidate in (
+        Path.home() / ".local" / "bin" / binary_name,
+        Path.home() / "Desktop" / binary_name,
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
 
 
 def supports_symlinks() -> bool:
@@ -116,6 +154,7 @@ def acquire_instance_lock() -> None:
     try:
         if is_windows():
             import msvcrt
+
             try:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
             except (IOError, OSError):
@@ -125,6 +164,7 @@ def acquire_instance_lock() -> None:
                 )
         else:
             import fcntl
+
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except (IOError, OSError):
@@ -194,12 +234,14 @@ def release_instance_lock() -> None:
     try:
         if is_windows():
             import msvcrt
+
             try:
                 msvcrt.locking(_lock_fd, msvcrt.LK_UNLCK, 1)
             except (IOError, OSError):
                 pass
         else:
             import fcntl
+
             try:
                 fcntl.flock(_lock_fd, fcntl.LOCK_UN)
             except (IOError, OSError):

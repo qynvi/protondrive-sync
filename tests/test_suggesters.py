@@ -1,6 +1,5 @@
 """Tests for path suggesters."""
 
-import pytest
 from pathlib import Path
 
 from protondrive_sync.core.suggesters import LocalPathSuggester
@@ -86,13 +85,3 @@ class TestLocalPathSuggester:
         """Returns None for relative paths (must start with / or ~)."""
         s = LocalPathSuggester()
         assert s._suggest_path("some/relative") is None
-
-
-class TestRcloneLsjsonFlags:
-    """Test that rclone_lsjson flag guarding works."""
-
-    def test_mutually_exclusive_flags(self):
-        """files_only and dirs_only cannot both be True."""
-        from protondrive_sync.core.rclone import rclone_lsjson
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            rclone_lsjson("remote", "path", files_only=True, dirs_only=True)

@@ -43,31 +43,13 @@ if [ "$PYTHON_MAJOR" -lt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR"
 fi
 ok "Python $PYTHON_VERSION"
 
-# rclone
-if command -v rclone &>/dev/null; then
-    RCLONE_VER=$(rclone version 2>/dev/null | head -1)
-    ok "rclone: $RCLONE_VER"
+# Proton Drive CLI
+if [ -x "${SCRIPT_DIR}/vendor/proton-drive-cli/proton-drive" ]; then
+    CLI_VER=$("${SCRIPT_DIR}/vendor/proton-drive-cli/proton-drive" --version 2>/dev/null | head -1)
+    ok "Proton Drive CLI: ${CLI_VER}"
 else
-    warn "rclone not installed."
-    echo "    Install it before using the app:"
-    ARCH=$(uname -m)
-    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-        echo "      curl -L -O https://downloads.rclone.org/current/rclone-current-linux-arm64.deb"
-        echo "      sudo dpkg -i rclone-current-linux-arm64.deb"
-    elif [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
-        echo "      curl -L -O https://downloads.rclone.org/current/rclone-current-linux-amd64.deb"
-        echo "      sudo dpkg -i rclone-current-linux-amd64.deb"
-    else
-        echo "      curl https://rclone.org/install.sh | sudo bash"
-    fi
-    echo ""
-fi
-
-# FUSE
-if command -v fusermount &>/dev/null || command -v fusermount3 &>/dev/null; then
-    ok "FUSE available"
-else
-    warn "FUSE not found. Install it: sudo apt install fuse3"
+    info "Installing Proton Drive CLI ..."
+    "${SCRIPT_DIR}/scripts/install-proton-cli.sh"
 fi
 
 # ---------- venv + install ----------
@@ -115,80 +97,55 @@ fi
 # ---------- .desktop ----------
 
 echo ""
-info "Creating desktop shortcut ..."
+info "Creating desktop entry ..."
 
-# Find the user's Desktop directory (respects XDG)
+LAUNCHER="${SCRIPT_DIR}/launch.sh"
+chmod +x "$LAUNCHER" 2>/dev/null || true
+
+# launch.sh detects a terminal and spawns one itself when started from a GUI,
+# so the desktop entry just runs it directly (Terminal=false). This avoids
+# relying on the desktop environment to resolve a terminal for Terminal=true.
+make_desktop_file() {
+    cat > "$1" << DESKTOP_EOF
+[Desktop Entry]
+Type=Application
+Name=ProtonDrive Sync
+Comment=TUI management tool for Proton Drive CLI sync
+Exec=${LAUNCHER}
+Terminal=false
+Icon=${ICON_NAME}
+Categories=Utility;FileTools;
+StartupNotify=false
+DESKTOP_EOF
+    chmod +x "$1"
+}
+
+# Applications menu (app drawer)
+APPLICATIONS_DIR="${HOME}/.local/share/applications"
+mkdir -p "$APPLICATIONS_DIR"
+make_desktop_file "${APPLICATIONS_DIR}/${APP_NAME}.desktop"
+update-desktop-database "$APPLICATIONS_DIR" 2>/dev/null || true
+ok "Added to applications menu (${APPLICATIONS_DIR}/${APP_NAME}.desktop)"
+
+# Desktop shortcut (respects XDG)
 if command -v xdg-user-dir &>/dev/null; then
     DESKTOP_DIR=$(xdg-user-dir DESKTOP 2>/dev/null)
 else
     DESKTOP_DIR="${HOME}/Desktop"
 fi
-
-# Fallback if xdg-user-dir returns empty or nonexistent
 if [ -z "$DESKTOP_DIR" ] || [ ! -d "$DESKTOP_DIR" ]; then
     DESKTOP_DIR="${HOME}/Desktop"
 fi
 
-if [ ! -d "$DESKTOP_DIR" ]; then
-    warn "Desktop directory not found at ${DESKTOP_DIR}, skipping shortcut."
-else
-    # Detect terminal emulator
-    TERMINAL=""
-    TERMINAL_ARGS=""
-
-    if command -v gnome-terminal &>/dev/null; then
-        TERMINAL="gnome-terminal"
-        TERMINAL_ARGS="--window --"
-    elif command -v xfce4-terminal &>/dev/null; then
-        TERMINAL="xfce4-terminal"
-        TERMINAL_ARGS="--execute"
-    elif command -v konsole &>/dev/null; then
-        TERMINAL="konsole"
-        TERMINAL_ARGS="-e"
-    elif command -v xterm &>/dev/null; then
-        TERMINAL="xterm"
-        TERMINAL_ARGS="-e"
-    fi
-
-    LAUNCHER="${SCRIPT_DIR}/launch.sh"
-
-    if [ -z "$TERMINAL" ]; then
-        warn "No supported terminal emulator found. Writing .desktop with Terminal=true fallback."
-        EXEC_LINE="${LAUNCHER}"
-        USE_TERMINAL="true"
-    else
-        EXEC_LINE="${TERMINAL} ${TERMINAL_ARGS} ${LAUNCHER}"
-        USE_TERMINAL="false"
-    fi
-
+if [ -d "$DESKTOP_DIR" ]; then
     DESKTOP_FILE="${DESKTOP_DIR}/${APP_NAME}.desktop"
-
-    cat > "$DESKTOP_FILE" << DESKTOP_EOF
-[Desktop Entry]
-Type=Application
-Name=ProtonDrive Sync
-Comment=TUI management tool for Proton Drive sync via rclone
-Exec=${EXEC_LINE}
-Terminal=${USE_TERMINAL}
-Icon=${ICON_NAME}
-Categories=Utility;FileTools;
-StartupNotify=false
-DESKTOP_EOF
-
-    chmod +x "$DESKTOP_FILE"
-
-    # Mark as trusted on GNOME (best-effort)
+    make_desktop_file "$DESKTOP_FILE"
+    # Mark as trusted so GNOME/Nautilus will launch it (best-effort)
     gio set "$DESKTOP_FILE" metadata::trusted true 2>/dev/null || true
-
     ok "Desktop shortcut created at ${DESKTOP_FILE}"
+else
+    warn "Desktop directory not found at ${DESKTOP_DIR}, skipping desktop shortcut."
 fi
-
-# ---------- also install to applications menu ----------
-
-APPLICATIONS_DIR="${HOME}/.local/share/applications"
-mkdir -p "$APPLICATIONS_DIR"
-cp "${DESKTOP_DIR}/${APP_NAME}.desktop" "${APPLICATIONS_DIR}/${APP_NAME}.desktop" 2>/dev/null || true
-ok "Also added to applications menu"
 
 # ---------- done ----------
 
@@ -199,27 +156,9 @@ echo "============================================"
 echo ""
 echo "  Next steps:"
 echo ""
-
-if ! command -v rclone &>/dev/null; then
-    echo "  1. Install rclone (see above)"
-    echo "  2. Configure rclone:  rclone config"
-    echo "     - Create a remote of type 'protondrive'"
-    echo "     - Name it 'proton' (or update the name in app settings)"
-    echo "  3. Launch the app:    double-click 'ProtonDrive Sync' on desktop"
-    echo "                    or: ${VENV_DIR}/bin/protondrive-sync"
-else
-    if rclone listremotes 2>/dev/null | grep -q ":"; then
-        REMOTE_NAME=$(rclone listremotes 2>/dev/null | head -1 | tr -d ':')
-        echo "  rclone remote detected: ${REMOTE_NAME}"
-        echo "  (Make sure the app settings match this name)"
-        echo ""
-    else
-        echo "  1. Configure rclone:  rclone config"
-        echo "     - Create a remote of type 'protondrive'"
-        echo ""
-    fi
-    echo "  Launch the app:  double-click 'ProtonDrive Sync' on desktop"
-    echo "               or: ${VENV_DIR}/bin/protondrive-sync"
-fi
+echo "  1. Authenticate the Proton Drive CLI if needed:"
+echo "       ${SCRIPT_DIR}/vendor/proton-drive-cli/proton-drive auth login"
+echo "  2. Launch the app: double-click 'ProtonDrive Sync' on desktop"
+echo "                or: ${VENV_DIR}/bin/protondrive-sync"
 
 echo ""

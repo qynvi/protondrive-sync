@@ -10,7 +10,7 @@ from textual.binding import Binding
 
 from .core.config import load_config, save_config, ConfigError, AppConfig
 from .core.platform import (
-    find_rclone,
+    find_proton_cli,
     acquire_instance_lock,
     release_instance_lock,
     get_lock_holder_pid,
@@ -21,10 +21,10 @@ from .screens.main import MainScreen
 
 
 class ProtonDriveSyncApp(App):
-    """TUI management tool for Proton Drive sync via rclone."""
+    """TUI management tool for Proton Drive CLI-backed sync."""
 
     TITLE = "ProtonDrive Sync"
-    SUB_TITLE = "rclone-based folder sync manager"
+    SUB_TITLE = "Proton Drive CLI folder sync manager"
 
     CSS = """
     Screen {
@@ -47,7 +47,7 @@ class ProtonDriveSyncApp(App):
         margin-top: 1;
     }
 
-    #add-form, #pin-form, #settings-form, #service-form {
+    #add-form, #pin-form, #settings-form, #service-form, #verify-form {
         padding: 1 2;
     }
 
@@ -130,9 +130,9 @@ class ProtonDriveSyncApp(App):
 
     def on_mount(self) -> None:
         # Pre-flight checks
-        if not find_rclone():
+        if not find_proton_cli():
             self.notify(
-                "rclone not found! Install it first: https://rclone.org/install/",
+                "Proton Drive CLI not found. Run scripts/install-proton-cli.sh first.",
                 severity="error",
                 timeout=10,
             )
@@ -182,7 +182,11 @@ def main() -> None:
                 input("Press Enter to exit...")
                 sys.exit(1)
         else:
-            msg = f"Failed to terminate PID {pid}." if pid else "Could not identify holder PID."
+            msg = (
+                f"Failed to terminate PID {pid}."
+                if pid
+                else "Could not identify holder PID."
+            )
             print(f"{msg} You may need to kill it manually.")
             input("Press Enter to exit...")
             sys.exit(1)

@@ -1,35 +1,80 @@
 """Tests for migration module."""
 
-import threading
 import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from protondrive_sync.core.config import AppConfig, FolderMapping
 from protondrive_sync.core.migration import (
-    plan_migration,
-    execute_migration,
     execute_bisync_setup,
-    rollback_migration,
-    cleanup_backup,
-    teardown_mount,
     plan_bisync_setup,
     compare_local_remote,
     _matches_filter,
+    _scan_directory,
+    _is_large_initial_upload,
+    _scan_symlinks,
     _find_filtered_toplevel,
     _find_env_files,
+    _check_download_space,
+    _download_temp_path,
+    _publish_download_temp,
     _MAX_ATTEMPTS,
     MigrationError,
-    MigrationPlan,
+    MigrationCancelled,
     BisyncPlan,
     DivergenceReport,
 )
-from protondrive_sync.core.rclone import RemoteFileInfo, RcloneError, RcloneCancelled
+from protondrive_sync.core.proton_cli import ProtonError, RemoteNode
+from protondrive_sync.core.inventory import get_inventory_entry
+from tests.fake_backend import FakeBackend
+
+RemoteFileInfo = RemoteNode
 
 
 @pytest.fixture
-def config():
-    return AppConfig(mount_point="/tmp/test-mount")
+def config(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setattr(
+        "protondrive_sync.core.config.get_config_dir", lambda: config_dir
+    )
+    return AppConfig()
+
+
+@pytest.fixture(autouse=True)
+def p1_setup_external_stubs(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "protondrive_sync.core.migration.ProtonDriveCLI", lambda _config: FakeBackend()
+    )
+    monkeypatch.setattr(
+        "protondrive_sync.core.migration.probe_backend",
+        lambda _config: "cli vtest",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "protondrive_sync.core.migration.acquire_remote_lease",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "protondrive_sync.core.migration.ensure_check_access_sentinel",
+        lambda local_path, _remote_subpath, _config: (
+            Path(local_path) / ".protondrive-sync-check"
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "protondrive_sync.core.migration.verify_sync_detailed",
+        lambda *args, **kwargs: SimpleNamespace(
+            ok=True,
+            missing_on_dst=[],
+            missing_on_src=[],
+            different=[],
+            errors=[],
+            operation_log=None,
+        ),
+        raising=False,
+    )
 
 
 @pytest.fixture
@@ -72,113 +117,6 @@ def source_dir_with_git(tmp_path):
     return src
 
 
-class TestPlanMigration:
-    def test_creates_plan(self, source_dir, config):
-        plan = plan_migration(str(source_dir), "projects/test", config)
-        assert plan.file_count == 3
-        assert plan.total_size_bytes > 0
-        assert plan.remote_subpath == "projects/test"
-        assert plan.local_path == source_dir
-        assert "premigration-backup" in str(plan.backup_path)
-
-    def test_nonexistent_source_raises(self, config):
-        with pytest.raises(MigrationError, match="not a directory"):
-            plan_migration("/tmp/definitely-nonexistent-12345", "test", config)
-
-    def test_file_source_raises(self, tmp_path, config):
-        f = tmp_path / "notadir.txt"
-        f.write_text("x")
-        with pytest.raises(MigrationError, match="not a directory"):
-            plan_migration(str(f), "test", config)
-
-    def test_size_human(self, source_dir, config):
-        plan = plan_migration(str(source_dir), "test", config)
-        # Should be some bytes
-        assert "B" in plan.total_size_human
-
-
-class TestExecuteMigration:
-    @patch("protondrive_sync.core.migration.sync_upload")
-    @patch("protondrive_sync.core.migration.verify_sync", return_value=True)
-    @patch("protondrive_sync.core.migration.create_link")
-    def test_successful_migration(self, mock_link, mock_verify, mock_upload, source_dir, config):
-        plan = plan_migration(str(source_dir), "projects/test", config)
-        logs = []
-        result = execute_migration(plan, config, progress=logs.append)
-
-        assert result.success
-        assert "complete" in result.message.lower()
-        assert result.backup_path is not None
-        assert result.backup_path.exists()
-        # Original dir should have been moved to backup
-        assert not source_dir.exists()
-        mock_upload.assert_called_once()
-        mock_verify.assert_called_once()
-        mock_link.assert_called_once()
-
-    @patch("protondrive_sync.core.migration.time.sleep")
-    @patch("protondrive_sync.core.migration.sync_upload", side_effect=Exception("network error"))
-    def test_upload_failure(self, mock_upload, mock_sleep, source_dir, config):
-        plan = plan_migration(str(source_dir), "test", config)
-        result = execute_migration(plan, config)
-
-        assert not result.success
-        # Source should still exist (not moved)
-        assert source_dir.exists()
-        # All retry attempts should have been made
-        assert mock_upload.call_count == _MAX_ATTEMPTS
-
-    @patch("protondrive_sync.core.migration.sync_upload")
-    @patch("protondrive_sync.core.migration.verify_sync", return_value=False)
-    def test_verify_failure(self, mock_verify, mock_upload, source_dir, config):
-        plan = plan_migration(str(source_dir), "test", config)
-        result = execute_migration(plan, config)
-
-        assert not result.success
-        assert "verification" in result.message.lower()
-
-    @patch("protondrive_sync.core.migration.sync_upload")
-    @patch("protondrive_sync.core.migration.verify_sync", return_value=True)
-    @patch("protondrive_sync.core.migration.create_link", side_effect=Exception("link failed"))
-    def test_symlink_failure_rolls_back(self, mock_link, mock_verify, mock_upload, source_dir, config):
-        plan = plan_migration(str(source_dir), "test", config)
-        result = execute_migration(plan, config)
-
-        assert not result.success
-        # Rollback should have restored the original directory
-        assert source_dir.exists()
-
-
-class TestRollbackMigration:
-    def test_rollback(self, tmp_path):
-        # Simulate post-migration state: symlink + backup
-        original = tmp_path / "project"
-        backup = tmp_path / "project.premigration-backup"
-        backup.mkdir()
-        (backup / "file.txt").write_text("content")
-        original.symlink_to("/tmp/nonexistent-mount-point")
-
-        assert rollback_migration(str(original), str(backup))
-        assert original.is_dir()
-        assert not original.is_symlink()
-        assert (original / "file.txt").read_text() == "content"
-
-    def test_rollback_no_backup(self, tmp_path):
-        assert not rollback_migration(str(tmp_path / "nonexistent"))
-
-
-class TestCleanupBackup:
-    def test_cleanup(self, tmp_path):
-        backup = tmp_path / "project.premigration-backup"
-        backup.mkdir()
-        (backup / "file.txt").write_text("x")
-        assert cleanup_backup(str(backup))
-        assert not backup.exists()
-
-    def test_cleanup_nonexistent(self):
-        assert not cleanup_backup("/tmp/no-such-backup-dir-12345")
-
-
 class TestFilterMatching:
     def test_git_dir_matches(self):
         filters = ["- .git/**"]
@@ -190,6 +128,47 @@ class TestFilterMatching:
         filters = ["- __pycache__/**"]
         assert _matches_filter("__pycache__", filters)
         assert _matches_filter("__pycache__/foo.pyc", filters)
+
+    def test_recursive_directory_filter(self):
+        filters = [
+            "- **/node_modules/**",
+            "- **/.venv/**",
+            "- **/.local/**",
+            "- **/.cache/**",
+            "- **/.hf_cache/**",
+            "- **/hf_cache/**",
+            "- **/.huggingface/**",
+            "- **/.ipynb_checkpoints/**",
+            "- **/.gradio/**",
+            "- **/build/**",
+            "- **/dist/**",
+            "- **/out/**",
+            "- **/cmake-build-*/**",
+        ]
+        assert _matches_filter("src/node_modules/pkg/index.js", filters)
+        assert _matches_filter("packages/app/.venv/pyvenv.cfg", filters)
+        assert _matches_filter(
+            "ts_etl/.local/lib/python3.11/site-packages/numpy/__init__.py", filters
+        )
+        assert _matches_filter("ts_etl/.cache/pip/http-v2/cache.body", filters)
+        assert _matches_filter(
+            "yin-agent/core/speculation/weights/.hf_cache/models/blob", filters
+        )
+        assert _matches_filter(
+            "index-tts-2.0/checkpoints/hf_cache/models/blob", filters
+        )
+        assert _matches_filter(
+            "yin-agent/core/speculation/weights/.huggingface/token", filters
+        )
+        assert _matches_filter(
+            "index-tts-2.0/indextts/s2mel/modules/.ipynb_checkpoints/model.py", filters
+        )
+        assert _matches_filter("index-tts-2.0/.gradio/certificate.pem", filters)
+        assert _matches_filter("onnxruntime/build/Linux/Release/Makefile", filters)
+        assert _matches_filter("onnxruntime/build/Linux/Release/dist/pkg.whl", filters)
+        assert _matches_filter("repo/out/generated.bin", filters)
+        assert _matches_filter("repo/cmake-build-debug/CMakeCache.txt", filters)
+        assert not _matches_filter("src/modules/pkg/index.js", filters)
 
     def test_pyc_file_matches(self):
         filters = ["- *.pyc"]
@@ -223,6 +202,12 @@ class TestFilterMatching:
         assert _matches_filter(".git", filters)
 
 
+class TestInitialUploadRepair:
+    def test_large_initial_upload_threshold(self):
+        assert not _is_large_initial_upload(49 * 1024**3)
+        assert _is_large_initial_upload(50 * 1024**3)
+
+
 class TestFindFilteredToplevel:
     def test_finds_git_and_pycache(self, source_dir_with_git, config):
         items = _find_filtered_toplevel(source_dir_with_git, config.filters)
@@ -252,282 +237,71 @@ class TestFindEnvFiles:
         assert envs == []
 
 
-class TestPlanMigrationFiltered:
-    def test_plan_includes_filtered_items(self, source_dir_with_git, config):
-        plan = plan_migration(str(source_dir_with_git), "test", config)
-        assert ".git" in plan.filtered_items
-        assert "__pycache__" in plan.filtered_items
-        assert ".venv" in plan.filtered_items
+class TestScanSymlinks:
+    def test_counts_external_symlinks(self, tmp_path, config):
+        root = tmp_path / "root"
+        root.mkdir()
+        target = tmp_path / "outside.txt"
+        target.write_text("x")
+        (root / "outside-link").symlink_to(target)
 
-    def test_plan_includes_env_warnings(self, source_dir_with_git, config):
-        plan = plan_migration(str(source_dir_with_git), "test", config)
-        assert ".env" in plan.env_warnings
-        assert ".env.local" in plan.env_warnings
+        total, external, samples = _scan_symlinks(root, config.filters)
 
-    def test_plan_no_warnings_for_clean_dir(self, source_dir, config):
-        plan = plan_migration(str(source_dir), "test", config)
-        assert plan.filtered_items == []
-        assert plan.env_warnings == []
+        assert total == 1
+        assert external == 1
+        assert samples == ["outside-link"]
 
+    def test_skips_filtered_symlinks(self, tmp_path, config):
+        root = tmp_path / "root"
+        root.mkdir()
+        node_modules = root / "node_modules"
+        node_modules.mkdir()
+        (node_modules / "pkg-link").symlink_to(tmp_path)
 
-class TestPreserveFilteredItems:
-    @patch("protondrive_sync.core.migration.sync_upload")
-    @patch("protondrive_sync.core.migration.verify_sync", return_value=True)
-    @patch("protondrive_sync.core.migration.create_link")
-    def test_git_preserved_after_migration(
-        self, mock_link, mock_verify, mock_upload, source_dir_with_git, config, tmp_path
-    ):
-        # Set mount point to a real temp dir so shutil.move works
-        mount_dir = tmp_path / "mount" / "test"
-        mount_dir.mkdir(parents=True)
-        config.mount_point = str(tmp_path / "mount")
+        total, external, samples = _scan_symlinks(root, config.filters)
 
-        plan = plan_migration(str(source_dir_with_git), "test", config)
-        logs = []
-        result = execute_migration(plan, config, progress=logs.append)
-
-        assert result.success
-        assert ".git" in result.preserved_items
-        assert "__pycache__" in result.preserved_items
-        assert ".venv" in result.preserved_items
-
-        # Verify the items were actually moved to the mount target
-        assert (mount_dir / ".git" / "HEAD").exists()
-        assert (mount_dir / ".git" / "objects" / "abc123").exists()
-        assert (mount_dir / "__pycache__" / "main.cpython-312.pyc").exists()
-        assert (mount_dir / ".venv" / "pyvenv.cfg").exists()
-
-        # Verify they're gone from backup
-        assert not (plan.backup_path / ".git").exists()
-        assert not (plan.backup_path / "__pycache__").exists()
-
-    @patch("protondrive_sync.core.migration.sync_upload")
-    @patch("protondrive_sync.core.migration.verify_sync", return_value=True)
-    @patch("protondrive_sync.core.migration.create_link")
-    def test_no_preservation_for_clean_dir(
-        self, mock_link, mock_verify, mock_upload, source_dir, config, tmp_path
-    ):
-        mount_dir = tmp_path / "mount" / "test"
-        mount_dir.mkdir(parents=True)
-        config.mount_point = str(tmp_path / "mount")
-
-        plan = plan_migration(str(source_dir), "test", config)
-        result = execute_migration(plan, config)
-
-        assert result.success
-        assert result.preserved_items == []
+        assert total == 0
+        assert external == 0
+        assert samples == []
 
 
-class TestTeardownMount:
-    def test_teardown_with_backup(self, tmp_path):
-        """Teardown restores backup and removes symlink."""
-        # Simulate post-migration state
-        mount_dir = tmp_path / "mount" / "proj"
-        mount_dir.mkdir(parents=True)
-        (mount_dir / "file.py").write_text("content")
+class TestScanDirectorySymlinkMode:
+    def test_preserve_counts_file_symlink_as_metadata(self, tmp_path, config):
+        root = tmp_path / "root"
+        root.mkdir()
+        target = tmp_path / "target.txt"
+        target.write_text("x" * 1000)
+        link = root / "link.txt"
+        link.symlink_to(target)
 
-        backup = tmp_path / "proj.premigration-backup"
-        backup.mkdir()
-        (backup / "file.py").write_text("original content")
+        count, size = _scan_directory(root, config.filters, symlink_mode="preserve")
 
-        local = tmp_path / "proj"
-        local.symlink_to(mount_dir)
+        assert count == 1
+        assert size == len(str(target).encode("utf-8"))
 
-        result = teardown_mount(
-            local_path=str(local),
-            mount_point=str(tmp_path / "mount"),
-            remote_subpath="proj",
-            filters=[],
-        )
+    def test_copy_counts_file_symlink_target_size(self, tmp_path, config):
+        root = tmp_path / "root"
+        root.mkdir()
+        target = tmp_path / "target.txt"
+        target.write_text("x" * 1000)
+        (root / "link.txt").symlink_to(target)
 
-        assert result.success
-        assert result.method == "backup_restored"
-        assert local.is_dir()
-        assert not local.is_symlink()
-        assert (local / "file.py").read_text() == "original content"
-        assert not backup.exists()
+        count, size = _scan_directory(root, config.filters, symlink_mode="copy")
 
-    def test_teardown_recovers_git_from_mount(self, tmp_path):
-        """Teardown moves .git/ from mount back to restored dir."""
-        mount_dir = tmp_path / "mount" / "proj"
-        mount_dir.mkdir(parents=True)
-        (mount_dir / "file.py").write_text("code")
-        git_dir = mount_dir / ".git"
-        git_dir.mkdir()
-        (git_dir / "HEAD").write_text("ref: refs/heads/main")
+        assert count == 1
+        assert size == 1000
 
-        backup = tmp_path / "proj.premigration-backup"
-        backup.mkdir()
-        (backup / "file.py").write_text("code")
+    def test_skip_ignores_symlinks(self, tmp_path, config):
+        root = tmp_path / "root"
+        root.mkdir()
+        target = tmp_path / "target.txt"
+        target.write_text("x")
+        (root / "link.txt").symlink_to(target)
 
-        local = tmp_path / "proj"
-        local.symlink_to(mount_dir)
+        count, size = _scan_directory(root, config.filters, symlink_mode="skip")
 
-        filters = ["- .git/**"]
-        result = teardown_mount(
-            local_path=str(local),
-            mount_point=str(tmp_path / "mount"),
-            remote_subpath="proj",
-            filters=filters,
-        )
-
-        assert result.success
-        assert result.method == "backup_restored"
-        # .git should be in restored dir
-        assert (local / ".git" / "HEAD").exists()
-        assert (local / ".git" / "HEAD").read_text() == "ref: refs/heads/main"
-
-    def test_teardown_copy_from_mount_no_backup(self, tmp_path):
-        """When no backup exists, copy files from mount target."""
-        mount_dir = tmp_path / "mount" / "proj"
-        mount_dir.mkdir(parents=True)
-        (mount_dir / "file.py").write_text("from mount")
-        sub = mount_dir / "sub"
-        sub.mkdir()
-        (sub / "nested.py").write_text("nested")
-
-        local = tmp_path / "proj"
-        local.symlink_to(mount_dir)
-
-        result = teardown_mount(
-            local_path=str(local),
-            mount_point=str(tmp_path / "mount"),
-            remote_subpath="proj",
-            filters=[],
-        )
-
-        assert result.success
-        assert result.method == "copied_from_mount"
-        assert local.is_dir()
-        assert not local.is_symlink()
-        assert (local / "file.py").read_text() == "from mount"
-        assert (local / "sub" / "nested.py").read_text() == "nested"
-
-    def test_teardown_symlink_mount_down(self, tmp_path):
-        """Symlink exists but mount target doesn't — remove symlink, warn."""
-        local = tmp_path / "proj"
-        local.symlink_to(tmp_path / "nonexistent-mount")
-
-        result = teardown_mount(
-            local_path=str(local),
-            mount_point=str(tmp_path / "mount"),
-            remote_subpath="proj",
-            filters=[],
-        )
-
-        assert result.success
-        assert result.method == "mapping_only"
-        assert not local.exists()
-        assert not local.is_symlink()
-
-    def test_teardown_no_symlink_no_backup(self, tmp_path):
-        """No symlink, no backup — just remove the mapping."""
-        local = tmp_path / "proj"
-        # local doesn't exist at all
-
-        result = teardown_mount(
-            local_path=str(local),
-            mount_point=str(tmp_path / "mount"),
-            remote_subpath="proj",
-            filters=[],
-        )
-
-        assert result.success
-        assert result.method == "mapping_only"
-
-    def test_teardown_merges_newer_files_from_mount(self, tmp_path):
-        """Files edited after migration are merged from mount into backup."""
-        import time
-
-        # Simulate post-migration state: backup has original content
-        mount_dir = tmp_path / "mount" / "proj"
-        mount_dir.mkdir(parents=True)
-
-        backup = tmp_path / "proj.premigration-backup"
-        backup.mkdir()
-        (backup / "original.py").write_text("old version")
-        (backup / "unchanged.py").write_text("same")
-
-        # Wait a moment so mount files get a definitively newer mtime
-        time.sleep(0.05)
-
-        # Mount has: edited file, new file, unchanged file
-        (mount_dir / "original.py").write_text("EDITED via mount after migration")
-        (mount_dir / "new_file.py").write_text("created after migration")
-        (mount_dir / "unchanged.py").write_text("same")
-        # Make unchanged.py have an older mtime than backup
-        import os
-        backup_mtime = (backup / "unchanged.py").stat().st_mtime
-        os.utime(mount_dir / "unchanged.py", (backup_mtime - 10, backup_mtime - 10))
-
-        # Also put a new file in a subdirectory
-        (mount_dir / "sub").mkdir()
-        (mount_dir / "sub" / "deep.py").write_text("deep new file")
-
-        local = tmp_path / "proj"
-        local.symlink_to(mount_dir)
-
-        result = teardown_mount(
-            local_path=str(local),
-            mount_point=str(tmp_path / "mount"),
-            remote_subpath="proj",
-            filters=[],
-        )
-
-        assert result.success
-        assert result.method == "backup_restored"
-
-        # Edited file should have the newer version from mount
-        assert (local / "original.py").read_text() == "EDITED via mount after migration"
-
-        # New file should be present
-        assert (local / "new_file.py").read_text() == "created after migration"
-
-        # Unchanged file should still have original content
-        assert (local / "unchanged.py").read_text() == "same"
-
-        # Deeply nested new file should be present
-        assert (local / "sub" / "deep.py").read_text() == "deep new file"
-
-    def test_teardown_merge_skips_filtered_files(self, tmp_path):
-        """Merge step does not copy filtered files (e.g. *.pyc) into backup."""
-        import time
-
-        mount_dir = tmp_path / "mount" / "proj"
-        mount_dir.mkdir(parents=True)
-
-        backup = tmp_path / "proj.premigration-backup"
-        backup.mkdir()
-        (backup / "main.py").write_text("code")
-
-        time.sleep(0.05)
-
-        (mount_dir / "main.py").write_text("updated code")
-        # A loose .pyc file at root level — should be skipped by merge
-        (mount_dir / "stale.pyc").write_bytes(b"\x00\x01")
-        # A new non-filtered file — should be merged
-        (mount_dir / "new_util.py").write_text("new utility")
-
-        local = tmp_path / "proj"
-        local.symlink_to(mount_dir)
-
-        filters = ["- *.pyc"]
-        result = teardown_mount(
-            local_path=str(local),
-            mount_point=str(tmp_path / "mount"),
-            remote_subpath="proj",
-            filters=filters,
-        )
-
-        assert result.success
-        # .pyc should NOT have been merged
-        assert not (local / "stale.pyc").exists()
-        # Regular files should have been merged
-        assert (local / "main.py").read_text() == "updated code"
-        assert (local / "new_util.py").read_text() == "new utility"
-
-
-# --- compare_local_remote ---
+        assert count == 0
+        assert size == 0
 
 
 class TestCompareLocalRemote:
@@ -605,9 +379,16 @@ class TestCompareLocalRemote:
         """Filtered files excluded from comparison."""
         # source_dir_with_git has .git/, __pycache__/, .venv/ which are filtered
         remote_files = [
-            RemoteFileInfo(path="main.py", size=(source_dir_with_git / "main.py").stat().st_size),
-            RemoteFileInfo(path=".env", size=(source_dir_with_git / ".env").stat().st_size),
-            RemoteFileInfo(path=".env.local", size=(source_dir_with_git / ".env.local").stat().st_size),
+            RemoteFileInfo(
+                path="main.py", size=(source_dir_with_git / "main.py").stat().st_size
+            ),
+            RemoteFileInfo(
+                path=".env", size=(source_dir_with_git / ".env").stat().st_size
+            ),
+            RemoteFileInfo(
+                path=".env.local",
+                size=(source_dir_with_git / ".env.local").stat().st_size,
+            ),
         ]
         report = compare_local_remote(source_dir_with_git, remote_files, config)
         # .git, __pycache__, .venv should NOT appear in the comparison
@@ -619,8 +400,7 @@ class TestCompareLocalRemote:
 
 
 class TestPlanBisyncSetup:
-    @patch("protondrive_sync.core.migration.rclone_lsjson", return_value=[])
-    def test_existing_dir_with_files(self, mock_lsjson, source_dir, config):
+    def test_existing_dir_with_files(self, source_dir, config):
         """Standard case: local has files, remote empty."""
         plan = plan_bisync_setup(str(source_dir), "test/proj", config)
         assert plan.file_count == 3
@@ -628,12 +408,21 @@ class TestPlanBisyncSetup:
         assert not plan.local_is_empty
         assert plan.remote_file_count == 0
 
-    @patch("protondrive_sync.core.migration.rclone_lsjson", return_value=[
-        RemoteFileInfo(path="readme.md", size=500),
-        RemoteFileInfo(path="src/main.py", size=1200),
-    ])
-    def test_empty_local_pull_from_remote(self, mock_lsjson, tmp_path, config):
+    def test_empty_local_pull_from_remote(self, tmp_path, config, monkeypatch):
         """Pull scenario: local doesn't exist, remote has files."""
+        backend = FakeBackend(
+            {
+                "workspace/proj/readme.md": RemoteNode(
+                    path="workspace/proj/readme.md", name="readme.md", size=500
+                ),
+                "workspace/proj/src/main.py": RemoteNode(
+                    path="workspace/proj/src/main.py", name="main.py", size=1200
+                ),
+            }
+        )
+        monkeypatch.setattr(
+            "protondrive_sync.core.migration.ProtonDriveCLI", lambda _config: backend
+        )
         local = tmp_path / "new-project"
         plan = plan_bisync_setup(str(local), "workspace/proj", config)
         assert plan.local_is_empty
@@ -642,8 +431,7 @@ class TestPlanBisyncSetup:
         # Directory should have been created
         assert local.exists()
 
-    @patch("protondrive_sync.core.migration.rclone_lsjson", return_value=[])
-    def test_nonexistent_local_both_empty(self, mock_lsjson, tmp_path, config):
+    def test_nonexistent_local_both_empty(self, tmp_path, config):
         """Both sides empty: creates dir, sets local_is_empty."""
         local = tmp_path / "fresh-dir"
         plan = plan_bisync_setup(str(local), "empty/path", config)
@@ -651,13 +439,21 @@ class TestPlanBisyncSetup:
         assert plan.remote_file_count == 0
         assert local.exists()
 
-    @patch("protondrive_sync.core.migration.rclone_lsjson")
-    def test_both_have_files_divergence(self, mock_lsjson, source_dir, config):
+    def test_both_have_files_divergence(self, source_dir, config, monkeypatch):
         """Both have files with divergence."""
-        mock_lsjson.return_value = [
-            RemoteFileInfo(path="file1.txt", size=99999),  # different size
-            RemoteFileInfo(path="remote_only.py", size=500),
-        ]
+        backend = FakeBackend(
+            {
+                "test/file1.txt": RemoteNode(
+                    path="test/file1.txt", name="file1.txt", size=99999
+                ),
+                "test/remote_only.py": RemoteNode(
+                    path="test/remote_only.py", name="remote_only.py", size=500
+                ),
+            }
+        )
+        monkeypatch.setattr(
+            "protondrive_sync.core.migration.ProtonDriveCLI", lambda _config: backend
+        )
         config.size_change_threshold = 0.5
         plan = plan_bisync_setup(str(source_dir), "test", config)
         assert not plan.local_is_empty
@@ -666,13 +462,82 @@ class TestPlanBisyncSetup:
         assert plan.divergence.remote_only_count >= 1
         assert plan.divergence.size_mismatch_count >= 1
 
-    @patch("protondrive_sync.core.migration.rclone_lsjson", side_effect=Exception("offline"))
-    def test_remote_unreachable(self, mock_lsjson, source_dir, config):
-        """Graceful fallback when remote is unreachable."""
+    def test_remote_unreachable(self, source_dir, config, monkeypatch):
+        """Remote listing failures are surfaced instead of reported as empty."""
+
+        class FailingBackend(FakeBackend):
+            def list_recursive(self, rel):
+                raise ProtonError("offline")
+
+        monkeypatch.setattr(
+            "protondrive_sync.core.migration.ProtonDriveCLI",
+            lambda _config: FailingBackend(),
+        )
         plan = plan_bisync_setup(str(source_dir), "test", config)
         assert plan.file_count == 3
         assert plan.remote_file_count == 0
+        assert plan.remote_listing_error.startswith("offline")
         assert plan.divergence is None
+
+    def test_remote_listing_error_keeps_local_counts(
+        self, source_dir, config, monkeypatch
+    ):
+        class FailingBackend(FakeBackend):
+            def list_recursive(self, rel):
+                raise ProtonError("token expired")
+
+        monkeypatch.setattr(
+            "protondrive_sync.core.migration.ProtonDriveCLI",
+            lambda _config: FailingBackend(),
+        )
+        plan = plan_bisync_setup(str(source_dir), "test", config)
+        assert plan.file_count == 3
+        assert plan.remote_listing_error.startswith("token expired")
+
+    def test_cli_listing_error_is_reported(self, source_dir, config, monkeypatch):
+        class FailingBackend(FakeBackend):
+            def list_recursive(self, rel):
+                raise ProtonError("CLI list timed out")
+
+        monkeypatch.setattr(
+            "protondrive_sync.core.migration.ProtonDriveCLI",
+            lambda _config: FailingBackend(),
+        )
+        plan = plan_bisync_setup(str(source_dir), "test", config)
+
+        assert plan.remote_listing_error == "CLI list timed out"
+
+    def test_missing_remote_is_empty_not_listing_error(self, source_dir, config):
+        plan = plan_bisync_setup(str(source_dir), "deleted/remote", config)
+
+        assert not plan.local_is_empty
+        assert plan.remote_file_count == 0
+        assert plan.remote_size_bytes == 0
+        assert plan.remote_listing_error is None
+        assert plan.divergence is None
+
+    def test_empty_local_and_missing_remote_are_both_empty(self, tmp_path, config):
+        local = tmp_path / "new-empty"
+
+        plan = plan_bisync_setup(str(local), "deleted/remote", config)
+
+        assert plan.local_is_empty
+        assert plan.remote_file_count == 0
+        assert plan.remote_listing_error is None
+        assert local.exists()
+
+    def test_symlink_counts_in_plan(self, tmp_path, config):
+        root = tmp_path / "root"
+        root.mkdir()
+        target = tmp_path / "outside.txt"
+        target.write_text("x")
+        (root / "outside-link").symlink_to(target)
+
+        plan = plan_bisync_setup(str(root), "test", config)
+
+        assert plan.symlink_count == 1
+        assert plan.external_symlink_count == 1
+        assert plan.symlink_samples == ["outside-link"]
 
     def test_rejects_file_path(self, tmp_path, config):
         """Rejects path that exists but is a file."""
@@ -681,8 +546,7 @@ class TestPlanBisyncSetup:
         with pytest.raises(MigrationError, match="not a directory"):
             plan_bisync_setup(str(f), "test", config)
 
-    @patch("protondrive_sync.core.migration.rclone_lsjson", return_value=[])
-    def test_empty_existing_dir(self, mock_lsjson, tmp_path, config):
+    def test_empty_existing_dir(self, tmp_path, config):
         """Empty existing directory treated as pull mode."""
         empty = tmp_path / "empty-dir"
         empty.mkdir()
@@ -693,7 +557,15 @@ class TestPlanBisyncSetup:
 # --- execute_bisync_setup retry logic ---
 
 
-def _make_bisync_plan(tmp_path, *, local_is_empty=False, file_count=3):
+def _make_bisync_plan(
+    tmp_path,
+    *,
+    local_is_empty=True,
+    file_count=3,
+    symlink_mode="preserve",
+    remote_file_count=0,
+    remote_size_bytes=100,
+):
     """Helper: build a BisyncPlan for testing."""
     src = tmp_path / "proj"
     src.mkdir(exist_ok=True)
@@ -705,116 +577,98 @@ def _make_bisync_plan(tmp_path, *, local_is_empty=False, file_count=3):
         file_count=file_count,
         total_size_bytes=100,
         local_is_empty=local_is_empty,
+        remote_file_count=remote_file_count,
+        remote_size_bytes=remote_size_bytes,
+        symlink_mode=symlink_mode,
     )
 
 
-class TestBisyncSetupRetry:
-    @patch("protondrive_sync.core.migration.time.sleep")
-    @patch("protondrive_sync.core.migration.rclone_mkdir")
-    @patch("protondrive_sync.core.migration.run_bisync")
-    def test_succeeds_first_attempt(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
-        """No retry needed when first attempt succeeds."""
-        plan = _make_bisync_plan(tmp_path)
-        result = execute_bisync_setup(plan, config)
-        assert result.success
-        assert mock_bisync.call_count == 1
-        mock_sleep.assert_not_called()
-
-    @patch("protondrive_sync.core.migration.time.sleep")
-    @patch("protondrive_sync.core.migration.rclone_mkdir")
-    @patch("protondrive_sync.core.migration.run_bisync")
-    def test_succeeds_on_retry(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
-        """Recovers after transient failures."""
-        mock_bisync.side_effect = [
-            RcloneError("stalled"),
-            RcloneError("API 429"),
-            None,  # third attempt succeeds
-        ]
-        logs = []
-        result = execute_bisync_setup(plan=_make_bisync_plan(tmp_path), config=config, progress=logs.append)
-        assert result.success
-        assert mock_bisync.call_count == 3
-        assert any("Retrying" in l for l in logs)
-
-    @patch("protondrive_sync.core.migration.time.sleep")
-    @patch("protondrive_sync.core.migration.rclone_mkdir")
-    @patch("protondrive_sync.core.migration.run_bisync", side_effect=RcloneError("fail"))
-    def test_all_attempts_exhausted(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
-        """Returns failure after all retry attempts are exhausted."""
-        result = execute_bisync_setup(plan=_make_bisync_plan(tmp_path), config=config)
-        assert not result.success
-        assert not result.cancelled
-        assert mock_bisync.call_count == _MAX_ATTEMPTS
-        assert f"after {_MAX_ATTEMPTS} attempts" in result.message
-
-    @patch("protondrive_sync.core.migration.time.sleep")
-    @patch("protondrive_sync.core.migration.rclone_mkdir")
-    @patch("protondrive_sync.core.migration.run_bisync", side_effect=RcloneCancelled("abort"))
-    def test_cancel_not_retried(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
-        """Cancellation is never retried."""
-        result = execute_bisync_setup(plan=_make_bisync_plan(tmp_path), config=config)
-        assert not result.success
-        assert result.cancelled
-        assert mock_bisync.call_count == 1
-
-    @patch("protondrive_sync.core.migration.time.sleep")
-    @patch("protondrive_sync.core.migration.rclone_mkdir")
-    @patch("protondrive_sync.core.migration.run_bisync")
-    def test_cancel_during_backoff(self, mock_bisync, mock_mkdir, mock_sleep, tmp_path, config):
-        """Cancel event during backoff wait aborts early."""
-        cancel = threading.Event()
-        # First bisync call fails AND sets the cancel event so the
-        # subsequent backoff wait detects cancellation immediately.
-        def fail_and_cancel(*args, **kwargs):
-            cancel.set()
-            raise RcloneError("fail")
-        mock_bisync.side_effect = fail_and_cancel
-        plan = _make_bisync_plan(tmp_path)
-        result = execute_bisync_setup(plan, config, cancel_event=cancel)
-        assert not result.success
-        assert result.cancelled
-        # Only one bisync call — cancel hits during backoff
-        assert mock_bisync.call_count == 1
-
-
-class TestMountMigrationRetry:
-    @patch("protondrive_sync.core.migration.time.sleep")
-    @patch("protondrive_sync.core.migration.sync_upload")
-    @patch("protondrive_sync.core.migration.verify_sync", return_value=True)
-    @patch("protondrive_sync.core.migration.create_link")
-    def test_upload_succeeds_on_retry(
-        self, mock_link, mock_verify, mock_upload, mock_sleep, source_dir, config,
+class TestCliBisyncSetup:
+    def test_initial_upload_uses_cli_and_seeds_inventory(
+        self, tmp_path, config, monkeypatch
     ):
-        """Upload retries after transient failure and succeeds."""
-        mock_upload.side_effect = [
-            RcloneError("stalled"),
-            None,  # second attempt succeeds
-        ]
-        plan = plan_migration(str(source_dir), "projects/test", config)
-        logs = []
-        result = execute_migration(plan, config, progress=logs.append)
+        plan = _make_bisync_plan(tmp_path, local_is_empty=False, remote_file_count=0)
+        backend = FakeBackend()
+        monkeypatch.setattr(
+            "protondrive_sync.core.migration.ProtonDriveCLI", lambda _config: backend
+        )
+        result = execute_bisync_setup(plan, config)
+
         assert result.success
-        assert mock_upload.call_count == 2
-        assert any("Retrying upload" in l for l in logs)
+        assert "workspace/proj/a.py" in backend.uploaded
+        entry = get_inventory_entry(config, result.mapping, "a.py")
+        assert entry is not None
+        assert entry.remote_sha1
+        assert entry.last_source == "setup"
 
-    @patch("protondrive_sync.core.migration.time.sleep")
-    @patch("protondrive_sync.core.migration.sync_upload", side_effect=RcloneError("fail"))
-    def test_upload_all_attempts_fail(self, mock_upload, mock_sleep, source_dir, config):
-        """Returns failure after all upload retry attempts are exhausted."""
-        plan = plan_migration(str(source_dir), "projects/test", config)
-        result = execute_migration(plan, config)
-        assert not result.success
-        assert mock_upload.call_count == _MAX_ATTEMPTS
-        assert f"after {_MAX_ATTEMPTS} attempts" in result.message
-        # Source dir should still exist (not moved to backup)
-        assert source_dir.exists()
+    def test_initial_download_stages_publishes_and_seeds_inventory(
+        self, tmp_path, config, monkeypatch
+    ):
+        import hashlib
 
-    @patch("protondrive_sync.core.migration.time.sleep")
-    @patch("protondrive_sync.core.migration.sync_upload", side_effect=RcloneCancelled("abort"))
-    def test_upload_cancel_not_retried(self, mock_upload, mock_sleep, source_dir, config):
-        """Cancellation during upload is never retried."""
-        plan = plan_migration(str(source_dir), "projects/test", config)
-        result = execute_migration(plan, config)
-        assert not result.success
-        assert result.cancelled
-        assert mock_upload.call_count == 1
+        content = b"remote data"
+        sha1 = hashlib.sha1(content).hexdigest()
+        remote_path = "workspace/proj/remote.txt"
+        backend = FakeBackend(
+            nodes={
+                remote_path: RemoteNode(
+                    path=remote_path,
+                    name="remote.txt",
+                    size=len(content),
+                    sha1=sha1,
+                    modtime="2026-01-01T00:00:00Z",
+                )
+            },
+            blobs={remote_path: content},
+        )
+        monkeypatch.setattr(
+            "protondrive_sync.core.migration.ProtonDriveCLI", lambda _config: backend
+        )
+        plan = _make_bisync_plan(
+            tmp_path,
+            local_is_empty=True,
+            remote_file_count=1,
+            remote_size_bytes=len(content),
+        )
+
+        result = execute_bisync_setup(plan, config)
+
+        assert result.success
+        assert (plan.local_path / "remote.txt").read_bytes() == content
+        assert not list(plan.local_path.parent.glob("proj.protondrive-download-tmp.*"))
+        entry = get_inventory_entry(config, result.mapping, "remote.txt")
+        assert entry is not None
+        assert entry.remote_sha1 == sha1
+
+    def test_initial_upload_retries_cli_failures(self, tmp_path, config, monkeypatch):
+        class FlakyBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def upload_many(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ProtonError("offline")
+                return super().upload_many(*args, **kwargs)
+
+        backend = FlakyBackend()
+        monkeypatch.setattr(
+            "protondrive_sync.core.migration.ProtonDriveCLI", lambda _config: backend
+        )
+        monkeypatch.setattr(
+            "protondrive_sync.core.migration.time.sleep", lambda _seconds: None
+        )
+        logs: list[str] = []
+
+        result = execute_bisync_setup(
+            _make_bisync_plan(tmp_path, local_is_empty=False, remote_file_count=0),
+            config,
+            progress=logs.append,
+        )
+
+        assert result.success
+        assert backend.calls == 2
+        assert any("Retrying resume upload" in line for line in logs)
+
+

@@ -14,12 +14,11 @@ import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .config import AppConfig, FolderMapping
-from .rclone import rclone_lsjson, rclone_moveto, RemoteFileInfo, RcloneError
+from .config import AppConfig, FolderMapping, effective_filters
+from .proton_cli import ProtonDriveCLI, ProtonError, RemoteNode
 from .migration import _matches_filter
 
 
@@ -27,32 +26,148 @@ from .migration import _matches_filter
 
 BACKUP_DIR_NAME = ".protondrive-sync-backups"
 
+
+def _folder_relative_nodes(
+    remote_nodes: list[RemoteNode], folder: FolderMapping
+) -> list[RemoteNode]:
+    """Return copies whose paths are relative to the folder mapping root."""
+    base = folder.remote_subpath.strip("/")
+    out: list[RemoteNode] = []
+    for node in remote_nodes:
+        rel = node.path.strip("/")
+        if base and rel.startswith(base + "/"):
+            rel = rel[len(base) + 1 :]
+        elif rel == base:
+            rel = ""
+        if folder.symlink_mode == "preserve" and rel.endswith(".rclonelink"):
+            rel = rel[: -len(".rclonelink")]
+        if not rel:
+            continue
+        out.append(
+            RemoteNode(
+                path=rel,
+                size=node.size,
+                is_dir=node.is_dir,
+                sha1=node.sha1,
+                modtime=node.modtime,
+                uid=node.uid,
+                name=node.name,
+            )
+        )
+    return out
+
+
 # --- Work file extensions (protected from delete-sync) ---
 
 WORK_EXTENSIONS: set[str] = {
     # Code
-    ".py", ".pyw", ".pyi",
-    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hh",
-    ".java", ".kt", ".kts",
-    ".go", ".rs", ".rb", ".php", ".swift", ".scala",
-    ".sh", ".bash", ".zsh", ".fish",
-    ".sql", ".r", ".m", ".mm",
-    ".cs", ".fs", ".vb",
-    ".lua", ".pl", ".pm", ".ex", ".exs",
-    ".zig", ".nim", ".v", ".d",
+    ".py",
+    ".pyw",
+    ".pyi",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".cc",
+    ".cxx",
+    ".hh",
+    ".java",
+    ".kt",
+    ".kts",
+    ".go",
+    ".rs",
+    ".rb",
+    ".php",
+    ".swift",
+    ".scala",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".sql",
+    ".r",
+    ".m",
+    ".mm",
+    ".cs",
+    ".fs",
+    ".vb",
+    ".lua",
+    ".pl",
+    ".pm",
+    ".ex",
+    ".exs",
+    ".zig",
+    ".nim",
+    ".v",
+    ".d",
     # Config / data
-    ".json", ".yaml", ".yml", ".toml", ".xml", ".csv", ".ini", ".cfg",
-    ".html", ".htm", ".css", ".scss", ".sass", ".less",
-    ".md", ".rst", ".tex", ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".xml",
+    ".csv",
+    ".ini",
+    ".cfg",
+    ".html",
+    ".htm",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".md",
+    ".rst",
+    ".tex",
+    ".txt",
     # Documents
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx",
-    ".ppt", ".pptx", ".odt", ".ods", ".odp",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".odt",
+    ".ods",
+    ".odp",
     # Notebooks
     ".ipynb",
     # Other
-    ".proto", ".graphql", ".gql",
-    ".makefile", ".dockerfile",
+    ".proto",
+    ".graphql",
+    ".gql",
+    ".makefile",
+    ".dockerfile",
+    # Model/checkpoint/data artifacts
+    ".pt",
+    ".pth",
+    ".safetensors",
+    ".ckpt",
+    ".onnx",
+    ".gguf",
+    ".bin",
+    ".pkl",
+    ".pickle",
+    ".joblib",
+    ".npz",
+    ".npy",
+    ".parquet",
+    ".arrow",
+    ".sqlite",
+    ".sqlite3",
+    ".db",
+    ".wav",
+    ".flac",
+    ".mp3",
+    ".ogg",
+    ".mp4",
+    ".mkv",
 }
 
 
@@ -132,13 +247,30 @@ def scan_for_modifications(
         return False
 
     try:
-        for root, dirs, files in os.walk(local_path):
+        for root, dirs, files in os.walk(
+            local_path,
+            followlinks=(folder.symlink_mode == "copy"),
+        ):
             # Prune filtered directories from traversal
-            rel_root = Path(root).relative_to(local_path).as_posix()
             dirs[:] = [
-                d for d in dirs
-                if not _matches_filter(d, filters)
+                d
+                for d in dirs
+                if not _matches_filter(
+                    (Path(root) / d).relative_to(local_path).as_posix(), filters
+                )
             ]
+
+            for dirname in dirs:
+                dirpath = Path(root) / dirname
+                if not dirpath.is_symlink() or folder.symlink_mode == "copy":
+                    continue
+                if folder.symlink_mode == "skip":
+                    continue
+                try:
+                    if dirpath.lstat().st_mtime > since:
+                        return True
+                except OSError:
+                    continue
 
             # Check directory mtime — catches file additions/deletions
             # even when file mtimes are preserved
@@ -149,11 +281,19 @@ def scan_for_modifications(
                 pass
 
             for filename in files:
-                if _matches_filter(filename, filters):
+                rel_file = (Path(root) / filename).relative_to(local_path).as_posix()
+                if _matches_filter(rel_file, filters):
                     continue
                 filepath = Path(root) / filename
+                if filepath.is_symlink() and folder.symlink_mode == "skip":
+                    continue
                 try:
-                    if filepath.stat().st_mtime > since:
+                    stat = (
+                        filepath.lstat()
+                        if filepath.is_symlink() and folder.symlink_mode == "preserve"
+                        else filepath.stat()
+                    )
+                    if stat.st_mtime > since:
                         return True
                 except OSError:
                     continue
@@ -176,10 +316,13 @@ class DeletedWorkFile:
 
 def detect_local_deletions(
     local_path: str,
-    remote_files: list[RemoteFileInfo],
+    remote_files: list[RemoteNode],
     filters: list[str],
+    config: AppConfig,
+    *,
+    symlink_mode: str = "preserve",
 ) -> tuple[list[DeletedWorkFile], list[str]]:
-    """Find work files deleted locally. Groups full-directory deletes.
+    """Find protected files deleted locally. Groups full-directory deletes.
 
     Returns:
         (deleted_work_files, deleted_work_dirs)
@@ -189,6 +332,7 @@ def detect_local_deletions(
     """
     local_base = Path(local_path)
     deleted_files: list[DeletedWorkFile] = []
+    missing_files: list[DeletedWorkFile] = []
 
     for rf in remote_files:
         if rf.is_dir:
@@ -198,8 +342,16 @@ def detect_local_deletions(
             continue
 
         local_file = local_base / rf.path
-        if not local_file.exists() and is_work_file(rf.path):
-            deleted_files.append(DeletedWorkFile(path=rf.path, remote_size=rf.size))
+        exists = (
+            os.path.lexists(local_file)
+            if symlink_mode == "preserve"
+            else local_file.exists()
+        )
+        if not exists:
+            missing = DeletedWorkFile(path=rf.path, remote_size=rf.size)
+            missing_files.append(missing)
+            if is_work_file(rf.path) or rf.size >= config.protect_delete_min_bytes:
+                deleted_files.append(missing)
 
     # Group by parent directory to detect full-directory deletes
     dir_deletes: dict[str, list[DeletedWorkFile]] = defaultdict(list)
@@ -214,67 +366,79 @@ def detect_local_deletions(
     files_handled_by_dir: set[str] = set()
 
     for dir_path, dir_deleted_files in dir_deletes.items():
-        # Count work files on remote in this directory
-        remote_work_in_dir = [
-            rf for rf in remote_files
+        remote_protected_in_dir = [
+            rf
+            for rf in remote_files
             if not rf.is_dir
             and str(Path(rf.path).parent) == dir_path
-            and is_work_file(rf.path)
+            and (is_work_file(rf.path) or rf.size >= config.protect_delete_min_bytes)
         ]
         local_dir = local_base / dir_path
 
         if (
-            len(dir_deleted_files) == len(remote_work_in_dir)
-            and len(remote_work_in_dir) > 0
+            len(dir_deleted_files) == len(remote_protected_in_dir)
+            and len(remote_protected_in_dir) > 0
             and not local_dir.exists()
         ):
             deleted_work_dirs.append(dir_path)
             files_handled_by_dir.update(df.path for df in dir_deleted_files)
 
+    # Also protect broad directory deletes even when extensions are not known.
+    broad_dirs: dict[str, list[DeletedWorkFile]] = defaultdict(list)
+    for missing in missing_files:
+        parent = str(Path(missing.path).parent)
+        if parent != ".":
+            broad_dirs[parent].append(missing)
+    for dir_path, items in broad_dirs.items():
+        if dir_path in deleted_work_dirs:
+            continue
+        local_dir = local_base / dir_path
+        total_bytes = sum(item.remote_size for item in items)
+        if not local_dir.exists() and (
+            len(items) >= config.protect_directory_delete_min_files
+            or total_bytes >= config.protect_directory_delete_min_bytes
+        ):
+            deleted_work_dirs.append(dir_path)
+            files_handled_by_dir.update(item.path for item in items)
+
     # Remove files that are handled at the directory level
     individual_deleted = [
-        df for df in deleted_files
-        if df.path not in files_handled_by_dir
+        df for df in deleted_files if df.path not in files_handled_by_dir
     ]
 
     return individual_deleted, deleted_work_dirs
 
 
 def protect_deleted_work_files(
-    remote_name: str,
     remote_subpath: str,
     deleted_files: list[DeletedWorkFile],
     deleted_dirs: list[str],
+    config: AppConfig | None = None,
 ) -> list[str]:
-    """Rename-backup deleted work files/dirs on remote before bisync runs.
-
-    Format: file.py → file.py.2605311233  (YYMMDDHHmm)
+    """Move deleted work files/dirs on remote to Proton Drive trash.
 
     Returns list of paths that were protected.
     """
-    timestamp = datetime.now().strftime("%y%m%d%H%M")
     protected: list[str] = []
+    backend = ProtonDriveCLI(config or AppConfig())
 
-    # Directory-level renames first
+    # Directory-level trash first
     for dir_path in deleted_dirs:
-        src = f"{remote_name}:{remote_subpath}/{dir_path}"
-        dst = f"{remote_name}:{remote_subpath}/{BACKUP_DIR_NAME}/{dir_path}.{timestamp}"
+        src = f"{remote_subpath}/{dir_path}".strip("/")
         try:
-            rclone_moveto(src, dst)
-            protected.append(f"{dir_path}/ → {BACKUP_DIR_NAME}/{dir_path}.{timestamp}/")
-        except RcloneError:
-            # Fall through to individual file protection below
+            backend.trash(src)
+            protected.append(f"{dir_path}/ → Proton Drive trash")
+        except ProtonError:
             pass
 
-    # Individual file renames
+    # Individual file trash
     for df in deleted_files:
-        src = f"{remote_name}:{remote_subpath}/{df.path}"
-        dst = f"{remote_name}:{remote_subpath}/{BACKUP_DIR_NAME}/{df.path}.{timestamp}"
+        src = f"{remote_subpath}/{df.path}".strip("/")
         try:
-            rclone_moveto(src, dst)
-            protected.append(f"{df.path} → {BACKUP_DIR_NAME}/{df.path}.{timestamp}")
-        except RcloneError:
-            pass  # best-effort — don't block sync for rename failures
+            backend.trash(src)
+            protected.append(f"{df.path} → Proton Drive trash")
+        except ProtonError:
+            pass  # best-effort — don't block sync for protection failures
 
     return protected
 
@@ -310,8 +474,8 @@ class FlaggedChange:
 
 
 def detect_suspicious_changes(
-    local_path: str,
-    remote_files: list[RemoteFileInfo],
+    folder: FolderMapping,
+    remote_files: list[RemoteNode],
     config: AppConfig,
 ) -> list[FlaggedChange]:
     """Compare local vs remote file sizes. Flag changes exceeding threshold.
@@ -319,7 +483,7 @@ def detect_suspicious_changes(
     Only flags files larger than config.size_change_min_bytes that changed
     by more than config.size_change_threshold (as a ratio).
     """
-    local_base = Path(local_path)
+    local_base = Path(folder.local_path)
     flagged: list[FlaggedChange] = []
 
     # Build remote size lookup
@@ -332,11 +496,19 @@ def detect_suspicious_changes(
             continue
 
         local_file = local_base / rel_path
-        if not local_file.exists():
+        exists = (
+            os.path.lexists(local_file)
+            if folder.symlink_mode == "preserve"
+            else local_file.exists()
+        )
+        if not exists:
             continue  # deletion, handled by delete protection
 
         try:
-            local_size = local_file.stat().st_size
+            if local_file.is_symlink() and folder.symlink_mode == "preserve":
+                local_size = len(os.readlink(local_file).encode("utf-8"))
+            else:
+                local_size = local_file.stat().st_size
         except OSError:
             continue
 
@@ -345,14 +517,86 @@ def detect_suspicious_changes(
 
         change_ratio = abs(local_size - remote_size) / remote_size
         if change_ratio >= config.size_change_threshold:
-            flagged.append(FlaggedChange(
-                path=rel_path,
-                local_size=local_size,
-                remote_size=remote_size,
-                change_pct=change_ratio * 100,
-            ))
+            flagged.append(
+                FlaggedChange(
+                    path=rel_path,
+                    local_size=local_size,
+                    remote_size=remote_size,
+                    change_pct=change_ratio * 100,
+                )
+            )
 
     return flagged
+
+
+def _entry_signature(
+    path: Path, *, preserve_symlink: bool
+) -> tuple[str, int, int, str | None] | None:
+    """Return a cheap stability signature for a local path."""
+    try:
+        if path.is_symlink() and preserve_symlink:
+            stat = path.lstat()
+            return (
+                "symlink",
+                len(os.readlink(path).encode("utf-8")),
+                stat.st_mtime_ns,
+                os.readlink(path),
+            )
+        stat = path.stat()
+        kind = "dir" if path.is_dir() else "file"
+        return (kind, stat.st_size, stat.st_mtime_ns, None)
+    except OSError:
+        return None
+
+
+def detect_unstable_writes(
+    folder: FolderMapping,
+    since: float,
+    filters: list[str],
+    *,
+    delay_seconds: int,
+) -> list[str]:
+    """Return changed local paths that are still mutating after a delay."""
+    local_path = Path(folder.local_path)
+    if not local_path.is_dir() or delay_seconds <= 0:
+        return []
+    preserve = folder.symlink_mode == "preserve"
+    candidates: dict[str, tuple[str, int, int, str | None]] = {}
+
+    try:
+        for root, dirs, files in os.walk(
+            local_path, followlinks=(folder.symlink_mode == "copy")
+        ):
+            dirs[:] = [
+                d
+                for d in dirs
+                if not _matches_filter(
+                    (Path(root) / d).relative_to(local_path).as_posix(), filters
+                )
+            ]
+            for name in [*dirs, *files]:
+                path = Path(root) / name
+                rel = path.relative_to(local_path).as_posix()
+                if _matches_filter(rel, filters):
+                    continue
+                sig = _entry_signature(path, preserve_symlink=preserve)
+                if sig is None:
+                    continue
+                if sig[2] / 1_000_000_000 > since:
+                    candidates[rel] = sig
+    except (OSError, PermissionError):
+        return []
+
+    if not candidates:
+        return []
+    time.sleep(delay_seconds)
+
+    unstable: list[str] = []
+    for rel, before in candidates.items():
+        after = _entry_signature(local_path / rel, preserve_symlink=preserve)
+        if after != before:
+            unstable.append(rel)
+    return sorted(unstable)
 
 
 # --- Pending review management ---
@@ -418,11 +662,19 @@ class SafetyReport:
     deleted_work_dirs: list[str] = field(default_factory=list)
     suspicious_changes: list[FlaggedChange] = field(default_factory=list)
     protected_paths: list[str] = field(default_factory=list)
+    remote_listing_error: str | None = None
+    sentinel_error: str | None = None
+    unstable_paths: list[str] = field(default_factory=list)
 
     @property
     def safe_to_sync(self) -> bool:
-        """False if there are suspicious changes requiring user review."""
-        return len(self.suspicious_changes) == 0
+        """False unless safety checks positively proved the sync is safe."""
+        return not (
+            self.suspicious_changes
+            or self.remote_listing_error
+            or self.sentinel_error
+            or self.unstable_paths
+        )
 
     @property
     def has_deletions(self) -> bool:
@@ -446,30 +698,36 @@ def run_safety_checks(
     report = SafetyReport()
 
     try:
-        remote_files = rclone_lsjson(
-            config.remote_name, folder.remote_subpath, recursive=True,
+        remote_files = _folder_relative_nodes(
+            ProtonDriveCLI(config).list_recursive(folder.remote_subpath), folder
         )
-    except RcloneError:
-        # Can't reach remote — skip safety checks, bisync will fail anyway
+    except ProtonError as exc:
+        report.remote_listing_error = str(exc)
         return report
 
     # Detect deletions
     report.deleted_work_files, report.deleted_work_dirs = detect_local_deletions(
-        folder.local_path, remote_files, config.filters,
+        folder.local_path,
+        remote_files,
+        effective_filters(config, folder),
+        config,
+        symlink_mode=folder.symlink_mode,
     )
 
     # Detect suspicious changes
     report.suspicious_changes = detect_suspicious_changes(
-        folder.local_path, remote_files, config,
+        folder,
+        remote_files,
+        config,
     )
 
     # Protect deleted work files on remote (rename-backup)
     if report.has_deletions:
         report.protected_paths = protect_deleted_work_files(
-            config.remote_name,
             folder.remote_subpath,
             report.deleted_work_files,
             report.deleted_work_dirs,
+            config,
         )
 
     return report

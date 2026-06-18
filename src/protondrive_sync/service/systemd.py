@@ -8,15 +8,12 @@ from pathlib import Path
 from textwrap import dedent
 
 from ..core.config import AppConfig
-from ..core.platform import find_rclone, is_linux
-from ..core.rclone import build_mount_args
+from ..core.platform import is_linux
 
 
-MOUNT_SERVICE_NAME = "protondrive-mount"
-PINNER_SERVICE_NAME = "protondrive-pinner"
 BISYNC_SERVICE_NAME = "protondrive-bisync"
 
-ALL_SERVICE_NAMES = (MOUNT_SERVICE_NAME, PINNER_SERVICE_NAME, BISYNC_SERVICE_NAME)
+ALL_SERVICE_NAMES = (BISYNC_SERVICE_NAME,)
 
 
 class SystemdError(Exception):
@@ -36,61 +33,6 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 # --- Unit file generation ---
-
-
-def generate_mount_service(config: AppConfig) -> str:
-    """Generate the systemd unit file for the rclone mount service."""
-    rclone_bin = find_rclone() or "/usr/bin/rclone"
-    mount_args = build_mount_args(config)
-    exec_args = " ".join(mount_args)
-    exec_line = f"{rclone_bin} {exec_args}"
-
-    if config.low_footprint:
-        priority_lines = "Nice=19\nIOSchedulingClass=idle"
-    else:
-        priority_lines = ""
-
-    return dedent(f"""\
-        [Unit]
-        Description=ProtonDrive rclone FUSE mount
-        After=network-online.target
-        Wants=network-online.target
-
-        [Service]
-        Type=simple
-        ExecStartPre=/bin/mkdir -p {config.mount_point}
-        ExecStart={exec_line}
-        ExecStop=/bin/fusermount -u {config.mount_point}
-        Restart=on-failure
-        RestartSec=10
-        Environment=HOME={Path.home()}
-        {priority_lines}
-
-        [Install]
-        WantedBy=default.target
-    """)
-
-
-def generate_pinner_service(config: AppConfig) -> str:
-    """Generate the systemd unit file for the cache pinner service."""
-    python = sys.executable
-
-    return dedent(f"""\
-        [Unit]
-        Description=ProtonDrive cache pinner
-        After={MOUNT_SERVICE_NAME}.service
-        Requires={MOUNT_SERVICE_NAME}.service
-
-        [Service]
-        Type=simple
-        ExecStart={python} -m protondrive_sync.pinner_main
-        Restart=on-failure
-        RestartSec=30
-        Environment=HOME={Path.home()}
-
-        [Install]
-        WantedBy=default.target
-    """)
 
 
 def generate_bisync_service(config: AppConfig) -> str:
@@ -137,18 +79,7 @@ def install_services(config: AppConfig) -> list[Path]:
     unit_dir = _user_unit_dir()
     written: list[Path] = []
 
-    # Mount + pinner: only if any folder uses mount mode
-    if config.has_mount_folders():
-        mount_path = unit_dir / f"{MOUNT_SERVICE_NAME}.service"
-        mount_path.write_text(generate_mount_service(config), encoding="utf-8")
-        written.append(mount_path)
-
-        pinner_path = unit_dir / f"{PINNER_SERVICE_NAME}.service"
-        pinner_path.write_text(generate_pinner_service(config), encoding="utf-8")
-        written.append(pinner_path)
-
-    # Bisync: only if any folder uses bisync mode
-    if config.has_bisync_folders():
+    if config.has_enabled_folders():
         bisync_path = unit_dir / f"{BISYNC_SERVICE_NAME}.service"
         bisync_path.write_text(generate_bisync_service(config), encoding="utf-8")
         written.append(bisync_path)
@@ -165,9 +96,7 @@ def install_services(config: AppConfig) -> list[Path]:
 def _get_active_service_names(config: AppConfig) -> list[str]:
     """Return which service names should be managed based on config."""
     names: list[str] = []
-    if config.has_mount_folders():
-        names.extend([MOUNT_SERVICE_NAME, PINNER_SERVICE_NAME])
-    if config.has_bisync_folders():
+    if config.has_enabled_folders():
         names.append(BISYNC_SERVICE_NAME)
     return names
 
@@ -218,7 +147,8 @@ def stop_services(config: AppConfig | None = None) -> bool:
 def service_status(service_name: str) -> dict[str, str]:
     """Get the status of a systemd service. Returns key properties."""
     result = _systemctl(
-        "show", f"{service_name}.service",
+        "show",
+        f"{service_name}.service",
         "--property=ActiveState,SubState,LoadState",
     )
     if result.returncode != 0:

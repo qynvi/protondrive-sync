@@ -1,3 +1,3 @@
-"""ProtonDrive Sync - TUI management tool for rclone-based Proton Drive sync."""
+"""ProtonDrive Sync - TUI management tool for Proton Drive CLI sync."""
 
 __version__ = "0.1.0"
